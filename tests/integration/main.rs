@@ -33,6 +33,7 @@ mod checkpoint_unit;
 mod cherry_pick;
 mod chinese_text_edits;
 mod ci_context_unit;
+mod ci_fork_notes;
 mod ci_handlers_comprehensive;
 mod ci_local_skip_fetch;
 mod ci_local_skip_push;

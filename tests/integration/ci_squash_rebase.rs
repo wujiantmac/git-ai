@@ -593,6 +593,7 @@ fn test_ci_rebase_merge_commit_order_pairing() {
         head_sha: feature_sha2.clone(),
         base_ref: "main".to_string(),
         base_sha,
+        fork_clone_url: None,
     };
 
     let ctx = CiContext::with_repository(git_ai_repo, event);
@@ -1430,6 +1431,7 @@ fn test_ci_squash_merge_not_misclassified_as_rebase_on_linear_main() {
         head_sha: head_sha.clone(),
         base_ref: "main".to_string(),
         base_sha: b3_sha.clone(),
+        fork_clone_url: None,
     };
 
     let ctx = CiContext::with_repository(git_ai_repo, event);
