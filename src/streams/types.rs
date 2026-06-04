@@ -34,7 +34,7 @@ pub fn read_jsonl_line(
 
 /// Errors that can occur during transcript processing.
 #[derive(Debug, Clone)]
-pub enum TranscriptError {
+pub enum StreamError {
     /// Transient errors that should be retried (file locked, network timeout).
     Transient {
         message: String,
@@ -46,10 +46,10 @@ pub enum TranscriptError {
     Fatal { message: String },
 }
 
-impl std::fmt::Display for TranscriptError {
+impl std::fmt::Display for StreamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TranscriptError::Transient {
+            StreamError::Transient {
                 message,
                 retry_after,
             } => write!(
@@ -57,22 +57,22 @@ impl std::fmt::Display for TranscriptError {
                 "Transient error (retry after {:?}): {}",
                 retry_after, message
             ),
-            TranscriptError::Parse { line, message } => {
+            StreamError::Parse { line, message } => {
                 write!(f, "Parse error at line {}: {}", line, message)
             }
-            TranscriptError::Fatal { message } => write!(f, "Fatal error: {}", message),
+            StreamError::Fatal { message } => write!(f, "Fatal error: {}", message),
         }
     }
 }
 
-impl std::error::Error for TranscriptError {}
+impl std::error::Error for StreamError {}
 
 /// Batch of transcript events returned by transcript readers after processing.
-pub struct TranscriptBatch {
+pub struct StreamBatch {
     /// Raw JSON events from the transcript.
     pub events: Vec<serde_json::Value>,
     /// Updated watermark position after processing this batch.
-    pub new_watermark: Box<dyn crate::transcripts::WatermarkStrategy>,
+    pub new_watermark: Box<dyn crate::streams::WatermarkStrategy>,
 }
 
 #[cfg(test)]
@@ -81,7 +81,7 @@ mod tests {
 
     #[test]
     fn test_transient_error_display() {
-        let err = TranscriptError::Transient {
+        let err = StreamError::Transient {
             message: "file locked".to_string(),
             retry_after: Duration::from_secs(5),
         };
@@ -93,7 +93,7 @@ mod tests {
 
     #[test]
     fn test_parse_error_display() {
-        let err = TranscriptError::Parse {
+        let err = StreamError::Parse {
             line: 42,
             message: "invalid JSON".to_string(),
         };
@@ -104,7 +104,7 @@ mod tests {
 
     #[test]
     fn test_fatal_error_display() {
-        let err = TranscriptError::Fatal {
+        let err = StreamError::Fatal {
             message: "file deleted".to_string(),
         };
         let display = format!("{}", err);
@@ -114,7 +114,7 @@ mod tests {
 
     #[test]
     fn test_error_is_std_error() {
-        let err = TranscriptError::Fatal {
+        let err = StreamError::Fatal {
             message: "test".to_string(),
         };
         let _: &dyn std::error::Error = &err;
@@ -122,13 +122,13 @@ mod tests {
 
     #[test]
     fn test_error_clone() {
-        let err = TranscriptError::Transient {
+        let err = StreamError::Transient {
             message: "test".to_string(),
             retry_after: Duration::from_secs(10),
         };
         let cloned = err.clone();
         match cloned {
-            TranscriptError::Transient {
+            StreamError::Transient {
                 message,
                 retry_after,
             } => {

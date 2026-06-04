@@ -1,21 +1,21 @@
-use crate::transcripts::sweep::TranscriptFormat;
-use crate::transcripts::types::TranscriptError;
+use crate::streams::sweep::StreamFormat;
+use crate::streams::types::StreamError;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::Path;
 
 pub fn extract_model(
     path: &Path,
-    format: TranscriptFormat,
+    format: StreamFormat,
     session_id: Option<&str>,
-) -> Result<Option<String>, TranscriptError> {
+) -> Result<Option<String>, StreamError> {
     match format {
-        TranscriptFormat::ClaudeJsonl
-        | TranscriptFormat::CopilotEventStreamJsonl
-        | TranscriptFormat::GeminiJsonl => extract_model_from_jsonl_tail(path),
-        TranscriptFormat::CopilotSessionJson => extract_model_from_copilot_session_json(path),
-        TranscriptFormat::AmpThreadJson => extract_model_from_amp_thread_json(path),
-        TranscriptFormat::OpenCodeSqlite => extract_model_from_opencode_sqlite(path, session_id),
+        StreamFormat::ClaudeJsonl
+        | StreamFormat::CopilotEventStreamJsonl
+        | StreamFormat::GeminiJsonl => extract_model_from_jsonl_tail(path),
+        StreamFormat::CopilotSessionJson => extract_model_from_copilot_session_json(path),
+        StreamFormat::AmpThreadJson => extract_model_from_amp_thread_json(path),
+        StreamFormat::OpenCodeSqlite => extract_model_from_opencode_sqlite(path, session_id),
         // Droid uses extract_model_from_droid_settings() with the settings path instead
         _ => Ok(None),
     }
@@ -23,7 +23,7 @@ pub fn extract_model(
 
 pub fn extract_model_from_droid_settings(
     settings_path: &Path,
-) -> Result<Option<String>, TranscriptError> {
+) -> Result<Option<String>, StreamError> {
     let content = match std::fs::read_to_string(settings_path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -39,7 +39,7 @@ pub fn extract_model_from_droid_settings(
     Ok(json.get("model").and_then(|v| v.as_str()).map(String::from))
 }
 
-fn extract_model_from_jsonl_tail(path: &Path) -> Result<Option<String>, TranscriptError> {
+fn extract_model_from_jsonl_tail(path: &Path) -> Result<Option<String>, StreamError> {
     let mut file = match File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -129,9 +129,9 @@ fn extract_model_from_jsonl_head(path: &Path) -> Option<String> {
 /// Given a transcript path like `.../transcripts/{session_id}.jsonl`,
 /// derives `.../debug-logs/{session_id}/models.json` and reads the default model.
 pub fn extract_model_from_copilot_models_json(
-    transcript_path: &Path,
-) -> Result<Option<String>, TranscriptError> {
-    let session_id = transcript_path
+    stream_path: &Path,
+) -> Result<Option<String>, StreamError> {
+    let session_id = stream_path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("");
@@ -141,7 +141,7 @@ pub fn extract_model_from_copilot_models_json(
 
     // transcript: .../transcripts/{session_id}.jsonl
     // models:     .../debug-logs/{session_id}/models.json
-    let transcripts_dir = match transcript_path.parent() {
+    let transcripts_dir = match stream_path.parent() {
         Some(p) => p,
         None => return Ok(None),
     };
@@ -175,7 +175,7 @@ pub fn extract_model_from_copilot_models_json(
     Ok(model)
 }
 
-fn extract_model_from_copilot_session_json(path: &Path) -> Result<Option<String>, TranscriptError> {
+fn extract_model_from_copilot_session_json(path: &Path) -> Result<Option<String>, StreamError> {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => return Ok(None),
@@ -200,7 +200,7 @@ fn extract_model_from_copilot_session_json(path: &Path) -> Result<Option<String>
     Ok(model)
 }
 
-fn extract_model_from_amp_thread_json(path: &Path) -> Result<Option<String>, TranscriptError> {
+fn extract_model_from_amp_thread_json(path: &Path) -> Result<Option<String>, StreamError> {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => return Ok(None),
@@ -229,8 +229,8 @@ fn extract_model_from_amp_thread_json(path: &Path) -> Result<Option<String>, Tra
 fn extract_model_from_opencode_sqlite(
     path: &Path,
     session_id: Option<&str>,
-) -> Result<Option<String>, TranscriptError> {
-    let conn = match crate::transcripts::agents::opencode::open_sqlite_readonly(path) {
+) -> Result<Option<String>, StreamError> {
+    let conn = match crate::streams::agents::opencode::open_sqlite_readonly(path) {
         Ok(c) => c,
         Err(_) => return Ok(None),
     };
@@ -288,7 +288,7 @@ mod tests {
     #[test]
     fn test_extract_model_claude() {
         let path = fixture_path("example-claude-code.jsonl");
-        let result = extract_model(&path, TranscriptFormat::ClaudeJsonl, None).unwrap();
+        let result = extract_model(&path, StreamFormat::ClaudeJsonl, None).unwrap();
         assert_eq!(result, Some("claude-sonnet-4-20250514".to_string()));
     }
 
@@ -302,14 +302,14 @@ mod tests {
     #[test]
     fn test_extract_model_copilot_session() {
         let path = fixture_path("copilot_session_simple.json");
-        let result = extract_model(&path, TranscriptFormat::CopilotSessionJson, None).unwrap();
+        let result = extract_model(&path, StreamFormat::CopilotSessionJson, None).unwrap();
         assert_eq!(result, Some("copilot/claude-sonnet-4".to_string()));
     }
 
     #[test]
     fn test_extract_model_copilot_event_stream() {
         let path = fixture_path("copilot_session_event_stream.jsonl");
-        let result = extract_model(&path, TranscriptFormat::CopilotEventStreamJsonl, None).unwrap();
+        let result = extract_model(&path, StreamFormat::CopilotEventStreamJsonl, None).unwrap();
         // No model field in this fixture
         assert_eq!(result, None);
     }
@@ -317,14 +317,14 @@ mod tests {
     #[test]
     fn test_extract_model_gemini() {
         let path = fixture_path("gemini-session-simple.jsonl");
-        let result = extract_model(&path, TranscriptFormat::GeminiJsonl, None).unwrap();
+        let result = extract_model(&path, StreamFormat::GeminiJsonl, None).unwrap();
         assert_eq!(result, Some("gemini-2.5-flash".to_string()));
     }
 
     #[test]
     fn test_extract_model_amp() {
         let path = fixture_path("amp-threads/T-019ca1ce-3ae2-7686-a41e-ccc078837f8a.json");
-        let result = extract_model(&path, TranscriptFormat::AmpThreadJson, None).unwrap();
+        let result = extract_model(&path, StreamFormat::AmpThreadJson, None).unwrap();
         assert_eq!(result, Some("claude-opus-4-6".to_string()));
     }
 
@@ -333,7 +333,7 @@ mod tests {
         let path = fixture_path("opencode-sqlite/opencode.db");
         let result = extract_model(
             &path,
-            TranscriptFormat::OpenCodeSqlite,
+            StreamFormat::OpenCodeSqlite,
             Some("test-session-123"),
         )
         .unwrap();
@@ -351,36 +351,35 @@ mod tests {
         ).unwrap();
         drop(conn);
 
-        let result =
-            extract_model(&db_path, TranscriptFormat::OpenCodeSqlite, Some("sess-1")).unwrap();
+        let result = extract_model(&db_path, StreamFormat::OpenCodeSqlite, Some("sess-1")).unwrap();
         assert_eq!(result, Some("claude-opus-4-6".to_string()));
     }
 
     #[test]
     fn test_extract_model_copilot_cli() {
         let path = fixture_path("copilot_cli_session_events.jsonl");
-        let result = extract_model(&path, TranscriptFormat::CopilotEventStreamJsonl, None).unwrap();
+        let result = extract_model(&path, StreamFormat::CopilotEventStreamJsonl, None).unwrap();
         assert_eq!(result, Some("gpt-4.1".to_string()));
     }
 
     #[test]
     fn test_extract_model_copilot_cli_no_model() {
         let path = fixture_path("copilot_cli_session_no_model.jsonl");
-        let result = extract_model(&path, TranscriptFormat::CopilotEventStreamJsonl, None).unwrap();
+        let result = extract_model(&path, StreamFormat::CopilotEventStreamJsonl, None).unwrap();
         assert_eq!(result, None);
     }
 
     #[test]
     fn test_extract_model_missing_file() {
         let path = PathBuf::from("/nonexistent/path/to/file.jsonl");
-        let result = extract_model(&path, TranscriptFormat::ClaudeJsonl, None).unwrap();
+        let result = extract_model(&path, StreamFormat::ClaudeJsonl, None).unwrap();
         assert_eq!(result, None);
     }
 
     #[test]
     fn test_extract_model_empty_file() {
         let file = tempfile::NamedTempFile::new().unwrap();
-        let result = extract_model(file.path(), TranscriptFormat::ClaudeJsonl, None).unwrap();
+        let result = extract_model(file.path(), StreamFormat::ClaudeJsonl, None).unwrap();
         assert_eq!(result, None);
     }
 
@@ -394,14 +393,14 @@ mod tests {
     #[test]
     fn test_extract_model_unsupported_format_returns_none() {
         let path = fixture_path("example-claude-code.jsonl");
-        let result = extract_model(&path, TranscriptFormat::DroidJsonl, None).unwrap();
+        let result = extract_model(&path, StreamFormat::DroidJsonl, None).unwrap();
         assert_eq!(result, None);
     }
 
     #[test]
     fn test_extract_model_claude_model_not_on_last_line() {
         let path = fixture_path("claude-model-not-last.jsonl");
-        let result = extract_model(&path, TranscriptFormat::ClaudeJsonl, None).unwrap();
+        let result = extract_model(&path, StreamFormat::ClaudeJsonl, None).unwrap();
         assert_eq!(result, Some("claude-opus-4-6".to_string()));
     }
 
@@ -414,7 +413,7 @@ mod tests {
         writeln!(file, r#"{{"type":"assistant","message":{{"model":"<synthetic>","content":[{{"type":"text","text":"bye"}}]}}}}"#).unwrap();
         file.flush().unwrap();
 
-        let result = extract_model(file.path(), TranscriptFormat::ClaudeJsonl, None).unwrap();
+        let result = extract_model(file.path(), StreamFormat::ClaudeJsonl, None).unwrap();
         assert_eq!(result, Some("claude-opus-4-6".to_string()));
     }
 
@@ -455,7 +454,7 @@ mod tests {
         );
 
         let result =
-            extract_model(file.path(), TranscriptFormat::CopilotEventStreamJsonl, None).unwrap();
+            extract_model(file.path(), StreamFormat::CopilotEventStreamJsonl, None).unwrap();
         assert_eq!(result, Some("gpt-4.1".to_string()));
     }
 }

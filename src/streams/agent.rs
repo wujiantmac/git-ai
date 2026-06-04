@@ -1,9 +1,81 @@
-// src/transcripts/agent.rs
+// src/streams/agent.rs
 
-use super::sweep::{DiscoveredSession, SweepStrategy};
-use super::types::{TranscriptBatch, TranscriptError};
+use super::sweep::{DiscoveredSession, StreamFormat, SweepStrategy};
+use super::types::{StreamBatch, StreamError};
 use super::watermark::WatermarkStrategy;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Sentinel session_id for shared stream watermark rows.
+/// Shared streams (e.g., a global OTEL SQLite DB) don't belong to any session —
+/// they use this constant as their DB key. The `stream_path` column
+/// disambiguates when multiple shared streams exist.
+pub const SHARED_STREAM_SESSION_ID: &str = "__shared__";
+
+/// Type alias for the custom path resolver function used in `PathResolverKind::Custom`.
+pub type PathResolverFn = Box<dyn Fn(&Path) -> Option<PathBuf> + Send + Sync>;
+
+pub enum PathResolverKind {
+    /// Same path as the session's stream_path
+    Identity,
+    /// Same directory, different filename
+    Sibling { filename: &'static str },
+    /// Custom resolution function
+    Custom(PathResolverFn),
+}
+
+/// Type alias for resolver functions that derive values from the resolved path.
+pub type WatermarkTypeResolverFn =
+    Box<dyn Fn(&Path) -> super::watermark::WatermarkType + Send + Sync>;
+pub type FormatResolverFn = Box<dyn Fn(&Path) -> StreamFormat + Send + Sync>;
+
+pub struct StreamDescriptor {
+    pub stream_kind: &'static str,
+    pub format: StreamFormat,
+    pub watermark_type: super::watermark::WatermarkType,
+    pub path_resolver: PathResolverKind,
+    /// When true, this stream's data source is shared across multiple sessions
+    /// (e.g., a global OTEL SQLite DB). The session_id for the DB record is derived
+    /// from the canonical path rather than the triggering session, so all sessions
+    /// share a single watermark.
+    pub shared: bool,
+    /// Optional function to determine watermark type from the resolved path.
+    /// Used when a single stream descriptor covers files with different watermark
+    /// strategies (e.g., Copilot .json vs .jsonl files).
+    pub watermark_type_resolver: Option<WatermarkTypeResolverFn>,
+    /// Optional function to determine transcript format from the resolved path.
+    pub format_resolver: Option<FormatResolverFn>,
+}
+
+impl StreamDescriptor {
+    pub fn resolve_path(&self, stream_path: &Path) -> Option<PathBuf> {
+        match &self.path_resolver {
+            PathResolverKind::Identity => Some(stream_path.to_path_buf()),
+            PathResolverKind::Sibling { filename } => {
+                stream_path.parent().map(|p| p.join(filename))
+            }
+            PathResolverKind::Custom(f) => f(stream_path),
+        }
+    }
+
+    pub fn effective_watermark_type(
+        &self,
+        resolved_path: &Path,
+    ) -> super::watermark::WatermarkType {
+        if let Some(resolver) = &self.watermark_type_resolver {
+            resolver(resolved_path)
+        } else {
+            self.watermark_type
+        }
+    }
+
+    pub fn effective_format(&self, resolved_path: &Path) -> StreamFormat {
+        if let Some(resolver) = &self.format_resolver {
+            resolver(resolved_path)
+        } else {
+            self.format
+        }
+    }
+}
 
 /// Unified trait for transcript agents.
 ///
@@ -17,7 +89,7 @@ pub trait Agent: Send + Sync {
     ///
     /// Returns ALL sessions found, regardless of whether they're in transcripts-db.
     /// The coordinator will compare against the DB to decide what to process.
-    fn discover_sessions(&self) -> Result<Vec<DiscoveredSession>, TranscriptError>;
+    fn discover_sessions(&self) -> Result<Vec<DiscoveredSession>, StreamError>;
 
     /// Maximum number of events to return per `read_incremental` call.
     /// Bounds peak memory to batch_size × avg_event_size instead of file_size.
@@ -38,7 +110,7 @@ pub trait Agent: Send + Sync {
         path: &Path,
         watermark: Box<dyn WatermarkStrategy>,
         session_id: &str,
-    ) -> Result<TranscriptBatch, TranscriptError>;
+    ) -> Result<StreamBatch, StreamError>;
 
     /// Extract per-event external IDs from a raw transcript event.
     ///
@@ -63,13 +135,27 @@ pub trait Agent: Send + Sync {
         is_first_event: bool,
     ) -> u32;
 
+    /// Extract the per-event session identifier from a raw event.
+    ///
+    /// For shared data sources (e.g., a global OTEL DB covering multiple sessions),
+    /// returns the session identifier embedded in the event itself. The worker uses
+    /// this to derive the correct session_id per emitted MetricEvent.
+    ///
+    /// Returns None to use the session record's session_id as-is.
+    fn extract_event_session_id(&self, _event: &serde_json::Value) -> Option<String> {
+        None
+    }
+
     /// Infer the working directory from the transcript file content.
     ///
     /// Reads the first few lines of the transcript looking for a `cwd` field.
     /// Returns None if the agent format doesn't include cwd or it can't be found.
-    fn infer_cwd(&self, _transcript_path: &Path) -> Option<std::path::PathBuf> {
+    fn infer_cwd(&self, _stream_path: &Path) -> Option<std::path::PathBuf> {
         None
     }
+
+    /// Returns the stream descriptors for this agent.
+    fn streams(&self) -> Vec<StreamDescriptor>;
 }
 
 /// Fallback timestamp from file metadata when an event lacks a per-event timestamp.

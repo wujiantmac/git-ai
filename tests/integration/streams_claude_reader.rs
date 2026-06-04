@@ -1,9 +1,9 @@
 //! Integration tests for Claude Code transcript reader.
 
-use git_ai::transcripts::agent::Agent;
-use git_ai::transcripts::agents::ClaudeAgent;
-use git_ai::transcripts::agents::claude::ClaudeAgent as ClaudeAgentImpl;
-use git_ai::transcripts::watermark::ByteOffsetWatermark;
+use git_ai::streams::agent::Agent;
+use git_ai::streams::agents::ClaudeAgent;
+use git_ai::streams::agents::claude::ClaudeAgent as ClaudeAgentImpl;
+use git_ai::streams::watermark::ByteOffsetWatermark;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::PathBuf;
@@ -119,7 +119,7 @@ fn test_claude_reader_file_not_found() {
     assert!(result.is_err());
     if let Err(e) = result {
         match e {
-            git_ai::transcripts::types::TranscriptError::Fatal { message } => {
+            git_ai::streams::types::StreamError::Fatal { message } => {
                 assert!(message.contains("not found"));
             }
             _ => panic!("Expected Fatal error, got {:?}", e),

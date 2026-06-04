@@ -1,10 +1,10 @@
 //! Gemini agent implementation with sweep discovery.
 
 use crate::authorship::authorship_log_serialization::generate_session_id;
-use crate::transcripts::agent::Agent;
-use crate::transcripts::sweep::{DiscoveredSession, SweepStrategy, TranscriptFormat};
-use crate::transcripts::types::{TranscriptBatch, TranscriptError};
-use crate::transcripts::watermark::{ByteOffsetWatermark, WatermarkStrategy, WatermarkType};
+use crate::streams::agent::{Agent, PathResolverKind, StreamDescriptor};
+use crate::streams::sweep::{DiscoveredSession, StreamFormat, SweepStrategy};
+use crate::streams::types::{StreamBatch, StreamError};
+use crate::streams::watermark::{ByteOffsetWatermark, WatermarkStrategy};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -81,7 +81,7 @@ impl Agent for GeminiAgent {
         SweepStrategy::Periodic(Duration::from_secs(30 * 60))
     }
 
-    fn discover_sessions(&self) -> Result<Vec<DiscoveredSession>, TranscriptError> {
+    fn discover_sessions(&self) -> Result<Vec<DiscoveredSession>, StreamError> {
         let paths = Self::scan_session_files();
         let mut sessions = Vec::new();
 
@@ -99,10 +99,7 @@ impl Agent for GeminiAgent {
             let session = DiscoveredSession {
                 session_id,
                 tool: "gemini".to_string(),
-                transcript_path: path,
-                transcript_format: TranscriptFormat::GeminiJsonl,
-                watermark_type: WatermarkType::ByteOffset,
-                initial_watermark: Box::new(ByteOffsetWatermark::new(0)),
+                stream_path: path,
                 external_session_id,
                 external_parent_session_id: None,
             };
@@ -118,14 +115,14 @@ impl Agent for GeminiAgent {
         path: &Path,
         watermark: Box<dyn WatermarkStrategy>,
         session_id: &str,
-    ) -> Result<TranscriptBatch, TranscriptError> {
+    ) -> Result<StreamBatch, StreamError> {
         use std::fs::File;
         use std::io::{BufReader, Seek, SeekFrom};
 
         let byte_watermark = watermark
             .as_any()
             .downcast_ref::<ByteOffsetWatermark>()
-            .ok_or_else(|| TranscriptError::Fatal {
+            .ok_or_else(|| StreamError::Fatal {
                 message: format!(
                     "Gemini reader requires ByteOffsetWatermark, got incompatible type for session {}",
                     session_id
@@ -136,15 +133,15 @@ impl Agent for GeminiAgent {
 
         let file = File::open(path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                TranscriptError::Fatal {
+                StreamError::Fatal {
                     message: format!("Transcript file not found: {}", path.display()),
                 }
             } else if e.kind() == std::io::ErrorKind::PermissionDenied {
-                TranscriptError::Fatal {
+                StreamError::Fatal {
                     message: format!("Permission denied reading transcript: {}", path.display()),
                 }
             } else {
-                TranscriptError::Transient {
+                StreamError::Transient {
                     message: format!("Failed to read transcript file: {}", e),
                     retry_after: Duration::from_secs(5),
                 }
@@ -155,7 +152,7 @@ impl Agent for GeminiAgent {
 
         reader
             .seek(SeekFrom::Start(start_offset))
-            .map_err(|e| TranscriptError::Transient {
+            .map_err(|e| StreamError::Transient {
                 message: format!("Failed to seek to offset {}: {}", start_offset, e),
                 retry_after: Duration::from_secs(5),
             })?;
@@ -167,15 +164,15 @@ impl Agent for GeminiAgent {
 
         let mut line = String::new();
         loop {
-            match crate::transcripts::types::read_jsonl_line(&mut reader, &mut line).map_err(
-                |e| TranscriptError::Transient {
+            match crate::streams::types::read_jsonl_line(&mut reader, &mut line).map_err(|e| {
+                StreamError::Transient {
                     message: format!("I/O error reading line: {}", e),
                     retry_after: Duration::from_secs(5),
-                },
-            )? {
-                crate::transcripts::types::JsonlLineState::Eof => break,
-                crate::transcripts::types::JsonlLineState::Partial => break,
-                crate::transcripts::types::JsonlLineState::Complete(bytes_read) => {
+                }
+            })? {
+                crate::streams::types::JsonlLineState::Eof => break,
+                crate::streams::types::JsonlLineState::Partial => break,
+                crate::streams::types::JsonlLineState::Complete(bytes_read) => {
                     line_number += 1;
                     current_offset += bytes_read as u64;
                 }
@@ -206,7 +203,7 @@ impl Agent for GeminiAgent {
 
         let new_watermark = Box::new(ByteOffsetWatermark::new(current_offset));
 
-        Ok(TranscriptBatch {
+        Ok(StreamBatch {
             events,
             new_watermark,
         })
@@ -218,9 +215,21 @@ impl Agent for GeminiAgent {
         file_meta: &std::fs::Metadata,
         is_first_event: bool,
     ) -> u32 {
-        crate::daemon::transcript_worker::extract_event_timestamp(event).unwrap_or_else(|| {
-            crate::transcripts::agent::file_time_fallback(file_meta, is_first_event)
-        })
+        crate::daemon::stream_worker::extract_event_timestamp(event)
+            .unwrap_or_else(|| crate::streams::agent::file_time_fallback(file_meta, is_first_event))
+    }
+
+    fn streams(&self) -> Vec<StreamDescriptor> {
+        let format = StreamFormat::GeminiJsonl;
+        vec![StreamDescriptor {
+            stream_kind: "transcript",
+            format,
+            watermark_type: format.watermark_type(),
+            path_resolver: PathResolverKind::Identity,
+            shared: false,
+            watermark_type_resolver: None,
+            format_resolver: None,
+        }]
     }
 }
 

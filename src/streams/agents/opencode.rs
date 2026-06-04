@@ -1,9 +1,9 @@
 //! OpenCode agent implementation (SQLite-only).
 
-use crate::transcripts::agent::Agent;
-use crate::transcripts::sweep::{DiscoveredSession, SweepStrategy};
-use crate::transcripts::types::{TranscriptBatch, TranscriptError};
-use crate::transcripts::watermark::{TimestampWatermark, WatermarkStrategy};
+use crate::streams::agent::{Agent, PathResolverKind, StreamDescriptor};
+use crate::streams::sweep::{DiscoveredSession, StreamFormat, SweepStrategy};
+use crate::streams::types::{StreamBatch, StreamError};
+use crate::streams::watermark::{TimestampWatermark, WatermarkStrategy};
 use chrono::DateTime;
 use rusqlite::{Connection, OpenFlags};
 use std::collections::HashMap;
@@ -26,17 +26,17 @@ impl OpenCodeAgent {
     }
 }
 
-pub fn open_sqlite_readonly(path: &Path) -> Result<Connection, TranscriptError> {
+pub fn open_sqlite_readonly(path: &Path) -> Result<Connection, StreamError> {
     let conn =
         Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e| {
-            TranscriptError::Fatal {
+            StreamError::Fatal {
                 message: format!("Failed to open OpenCode database {}: {}", path.display(), e),
             }
         })?;
 
-    conn.execute_batch("PRAGMA cache_size = -2000;")
-        .map_err(|e| TranscriptError::Fatal {
-            message: format!("Failed to set PRAGMA cache_size: {}", e),
+    conn.execute_batch("PRAGMA cache_size = -2000; PRAGMA busy_timeout = 5000;")
+        .map_err(|e| StreamError::Fatal {
+            message: format!("Failed to set PRAGMAs: {}", e),
         })?;
 
     Ok(conn)
@@ -49,7 +49,7 @@ fn read_session_messages_raw_with_limit(
     session_id: &str,
     after_updated: i64,
     limit: usize,
-) -> Result<Vec<(String, i64, serde_json::Value)>, TranscriptError> {
+) -> Result<Vec<(String, i64, serde_json::Value)>, StreamError> {
     let mut stmt = conn
         .prepare(
             "SELECT id, session_id, time_created, time_updated, data FROM message \
@@ -57,7 +57,7 @@ fn read_session_messages_raw_with_limit(
              ORDER BY time_updated ASC, id ASC \
              LIMIT ?",
         )
-        .map_err(|e| TranscriptError::Fatal {
+        .map_err(|e| StreamError::Fatal {
             message: format!("Failed to prepare message query: {}", e),
         })?;
 
@@ -70,19 +70,19 @@ fn read_session_messages_raw_with_limit(
             let data: String = row.get(4)?;
             Ok((id, row_session_id, time_created, time_updated, data))
         })
-        .map_err(|e| TranscriptError::Fatal {
+        .map_err(|e| StreamError::Fatal {
             message: format!("Failed to query messages: {}", e),
         })?;
 
     let mut messages = Vec::new();
     for row in rows {
         let (id, row_session_id, time_created, time_updated, data) =
-            row.map_err(|e| TranscriptError::Fatal {
+            row.map_err(|e| StreamError::Fatal {
                 message: format!("Failed to read message row: {}", e),
             })?;
 
         let parsed_data: serde_json::Value =
-            serde_json::from_str(&data).map_err(|e| TranscriptError::Parse {
+            serde_json::from_str(&data).map_err(|e| StreamError::Parse {
                 line: 0,
                 message: format!("Failed to parse message data for id {}: {}", id, e),
             })?;
@@ -119,7 +119,7 @@ fn read_parts_for_messages_with_limit(
     session_id: &str,
     after_updated: i64,
     limit: usize,
-) -> Result<HashMap<String, Vec<serde_json::Value>>, TranscriptError> {
+) -> Result<HashMap<String, Vec<serde_json::Value>>, StreamError> {
     let mut stmt = conn
         .prepare(
             "SELECT id, message_id, session_id, time_created, time_updated, data FROM part \
@@ -128,7 +128,7 @@ fn read_parts_for_messages_with_limit(
              ) \
              ORDER BY message_id ASC, time_updated ASC, id ASC",
         )
-        .map_err(|e| TranscriptError::Fatal {
+        .map_err(|e| StreamError::Fatal {
             message: format!("Failed to prepare part query: {}", e),
         })?;
 
@@ -149,14 +149,14 @@ fn read_parts_for_messages_with_limit(
                 data,
             ))
         })
-        .map_err(|e| TranscriptError::Fatal {
+        .map_err(|e| StreamError::Fatal {
             message: format!("Failed to query parts: {}", e),
         })?;
 
     let mut parts_by_message: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
     for row in rows {
         let (id, message_id, row_session_id, time_created, time_updated, data) =
-            row.map_err(|e| TranscriptError::Fatal {
+            row.map_err(|e| StreamError::Fatal {
                 message: format!("Failed to read part row: {}", e),
             })?;
 
@@ -205,7 +205,7 @@ impl Agent for OpenCodeAgent {
         SweepStrategy::Periodic(Duration::from_secs(30 * 60))
     }
 
-    fn discover_sessions(&self) -> Result<Vec<DiscoveredSession>, TranscriptError> {
+    fn discover_sessions(&self) -> Result<Vec<DiscoveredSession>, StreamError> {
         // Discovery comes from presets, not sweep.
         Ok(Vec::new())
     }
@@ -215,12 +215,12 @@ impl Agent for OpenCodeAgent {
         path: &Path,
         watermark: Box<dyn WatermarkStrategy>,
         session_id: &str,
-    ) -> Result<TranscriptBatch, TranscriptError> {
+    ) -> Result<StreamBatch, StreamError> {
         // Downcast to TimestampWatermark
         let ts_watermark = watermark
             .as_any()
             .downcast_ref::<TimestampWatermark>()
-            .ok_or_else(|| TranscriptError::Fatal {
+            .ok_or_else(|| StreamError::Fatal {
                 message: format!(
                     "OpenCode reader requires TimestampWatermark, got incompatible type for session {}",
                     session_id
@@ -244,7 +244,7 @@ impl Agent for OpenCodeAgent {
         )?;
 
         if messages.is_empty() {
-            return Ok(TranscriptBatch {
+            return Ok(StreamBatch {
                 events: Vec::new(),
                 new_watermark: Box::new(TimestampWatermark::new(ts_watermark.0)),
             });
@@ -280,7 +280,7 @@ impl Agent for OpenCodeAgent {
             DateTime::from_timestamp_millis(max_updated).unwrap_or(ts_watermark.0);
         let new_watermark = Box::new(TimestampWatermark::new(new_watermark_ts));
 
-        Ok(TranscriptBatch {
+        Ok(StreamBatch {
             events,
             new_watermark,
         })
@@ -324,9 +324,21 @@ impl Agent for OpenCodeAgent {
         file_meta: &std::fs::Metadata,
         is_first_event: bool,
     ) -> u32 {
-        crate::daemon::transcript_worker::extract_event_timestamp(event).unwrap_or_else(|| {
-            crate::transcripts::agent::file_time_fallback(file_meta, is_first_event)
-        })
+        crate::daemon::stream_worker::extract_event_timestamp(event)
+            .unwrap_or_else(|| crate::streams::agent::file_time_fallback(file_meta, is_first_event))
+    }
+
+    fn streams(&self) -> Vec<StreamDescriptor> {
+        let format = StreamFormat::OpenCodeSqlite;
+        vec![StreamDescriptor {
+            stream_kind: "transcript",
+            format,
+            watermark_type: format.watermark_type(),
+            path_resolver: PathResolverKind::Identity,
+            shared: false,
+            watermark_type_resolver: None,
+            format_resolver: None,
+        }]
     }
 }
 

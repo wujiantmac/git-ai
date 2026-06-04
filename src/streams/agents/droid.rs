@@ -1,20 +1,20 @@
-//! Cursor agent implementation with sweep discovery.
+//! Droid agent implementation with sweep discovery.
 
 use crate::authorship::authorship_log_serialization::generate_session_id;
-use crate::transcripts::agent::Agent;
-use crate::transcripts::sweep::{DiscoveredSession, SweepStrategy, TranscriptFormat};
-use crate::transcripts::types::{TranscriptBatch, TranscriptError};
-use crate::transcripts::watermark::{ByteOffsetWatermark, WatermarkStrategy, WatermarkType};
+use crate::streams::agent::{Agent, PathResolverKind, StreamDescriptor};
+use crate::streams::sweep::{DiscoveredSession, StreamFormat, SweepStrategy};
+use crate::streams::types::{StreamBatch, StreamError};
+use crate::streams::watermark::{HybridWatermark, WatermarkStrategy};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// Cursor agent that discovers conversations from Cursor storage.
-pub struct CursorAgent {
+/// Droid agent that discovers conversations from Droid storage.
+pub struct DroidAgent {
     batch_size: usize,
 }
 
-impl CursorAgent {
+impl DroidAgent {
     pub fn new() -> Self {
         Self { batch_size: 1000 }
     }
@@ -24,29 +24,26 @@ impl CursorAgent {
         Self { batch_size }
     }
 
-    /// Scan for Cursor conversation files in standard locations.
+    /// Scan for Droid conversation files in standard locations.
     fn scan_conversation_files() -> Vec<PathBuf> {
         let mut paths = Vec::new();
 
-        let base_dir = if let Ok(config_dir) = std::env::var("CURSOR_CONFIG_DIR") {
-            Some(PathBuf::from(config_dir))
-        } else {
-            dirs::home_dir().map(|p| p.join(".cursor"))
-        };
-
-        let search_dirs = vec![base_dir.as_ref().map(|p| p.join("projects"))];
+        // Droid transcripts are stored in ~/.factory/sessions/<project-dir>/<uuid>.jsonl
+        let search_dirs = vec![dirs::home_dir().map(|p| p.join(".factory/sessions"))];
 
         for dir_opt in search_dirs {
-            if let Some(dir) = dir_opt
-                && dir.exists()
+            if let Some(sessions_dir) = dir_opt
+                && sessions_dir.exists()
             {
-                Self::scan_jsonl_recursive(&dir, &mut paths);
+                // Recursively scan all project directories under sessions/
+                Self::scan_jsonl_recursive(&sessions_dir, &mut paths);
             }
         }
 
         paths
     }
 
+    /// Recursively scan directory for *.jsonl files (excluding .settings.json).
     fn scan_jsonl_recursive(dir: &Path, paths: &mut Vec<PathBuf>) {
         let Ok(entries) = fs::read_dir(dir) else {
             return;
@@ -56,7 +53,13 @@ impl CursorAgent {
             let path = entry.path();
             if path.is_dir() {
                 Self::scan_jsonl_recursive(&path, paths);
-            } else if path.is_file() && path.extension().map(|ext| ext == "jsonl").unwrap_or(false)
+            } else if path.is_file()
+                && path.extension().map(|ext| ext == "jsonl").unwrap_or(false)
+                && !path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.contains(".settings."))
+                    .unwrap_or(false)
             {
                 paths.push(path);
             }
@@ -64,28 +67,28 @@ impl CursorAgent {
     }
 }
 
-impl Default for CursorAgent {
+impl Default for DroidAgent {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Agent for CursorAgent {
+impl Agent for DroidAgent {
     fn batch_size_hint(&self) -> usize {
         self.batch_size
     }
 
     fn sweep_strategy(&self) -> SweepStrategy {
-        // Poll every 30 minutes for new Cursor conversations
+        // Poll every 30 minutes for new Droid conversations
         SweepStrategy::Periodic(Duration::from_secs(30 * 60))
     }
 
-    fn discover_sessions(&self) -> Result<Vec<DiscoveredSession>, TranscriptError> {
+    fn discover_sessions(&self) -> Result<Vec<DiscoveredSession>, StreamError> {
         let paths = Self::scan_conversation_files();
         let mut sessions = Vec::new();
 
         for path in paths {
-            // Cursor conversation_id is the file stem
+            // Droid session_id from the hook payload matches the file stem
             let Some(external_session_id) = path
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -93,15 +96,12 @@ impl Agent for CursorAgent {
             else {
                 continue;
             };
-            let session_id = generate_session_id(&external_session_id, "cursor");
+            let session_id = generate_session_id(&external_session_id, "droid");
 
             let session = DiscoveredSession {
                 session_id,
-                tool: "cursor".to_string(),
-                transcript_path: path,
-                transcript_format: TranscriptFormat::CursorJsonl,
-                watermark_type: WatermarkType::ByteOffset,
-                initial_watermark: Box::new(ByteOffsetWatermark::new(0)),
+                tool: "droid".to_string(),
+                stream_path: path,
                 external_session_id,
                 external_parent_session_id: None,
             };
@@ -117,33 +117,36 @@ impl Agent for CursorAgent {
         path: &Path,
         watermark: Box<dyn WatermarkStrategy>,
         session_id: &str,
-    ) -> Result<TranscriptBatch, TranscriptError> {
+    ) -> Result<StreamBatch, StreamError> {
         use std::fs::File;
         use std::io::{BufReader, Seek, SeekFrom};
 
-        let byte_watermark = watermark
+        // Downcast watermark to HybridWatermark
+        let hybrid_watermark = watermark
             .as_any()
-            .downcast_ref::<ByteOffsetWatermark>()
-            .ok_or_else(|| TranscriptError::Fatal {
+            .downcast_ref::<HybridWatermark>()
+            .ok_or_else(|| StreamError::Fatal {
                 message: format!(
-                    "Cursor reader requires ByteOffsetWatermark, got incompatible type for session {}",
+                    "Droid reader requires HybridWatermark, got incompatible type for session {}",
                     session_id
                 ),
             })?;
 
-        let start_offset = byte_watermark.0;
+        let start_offset = hybrid_watermark.offset;
+        let mut record_count = hybrid_watermark.record;
 
+        // Open file
         let file = File::open(path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                TranscriptError::Fatal {
+                StreamError::Fatal {
                     message: format!("Transcript file not found: {}", path.display()),
                 }
             } else if e.kind() == std::io::ErrorKind::PermissionDenied {
-                TranscriptError::Fatal {
+                StreamError::Fatal {
                     message: format!("Permission denied reading transcript: {}", path.display()),
                 }
             } else {
-                TranscriptError::Transient {
+                StreamError::Transient {
                     message: format!("Failed to open transcript file: {}", e),
                     retry_after: std::time::Duration::from_secs(5),
                 }
@@ -152,9 +155,10 @@ impl Agent for CursorAgent {
 
         let mut reader = BufReader::new(file);
 
+        // Seek to watermark position
         reader
             .seek(SeekFrom::Start(start_offset))
-            .map_err(|e| TranscriptError::Transient {
+            .map_err(|e| StreamError::Transient {
                 message: format!("Failed to seek to offset {}: {}", start_offset, e),
                 retry_after: std::time::Duration::from_secs(5),
             })?;
@@ -163,27 +167,32 @@ impl Agent for CursorAgent {
         let mut events = Vec::with_capacity(batch_limit);
         let mut current_offset = start_offset;
         let mut line_number = 0;
+        let mut latest_timestamp: Option<chrono::DateTime<chrono::Utc>> =
+            hybrid_watermark.timestamp;
 
+        // Read lines from watermark position
         let mut line = String::new();
         loop {
-            match crate::transcripts::types::read_jsonl_line(&mut reader, &mut line).map_err(
-                |e| TranscriptError::Transient {
+            match crate::streams::types::read_jsonl_line(&mut reader, &mut line).map_err(|e| {
+                StreamError::Transient {
                     message: format!("I/O error reading line: {}", e),
                     retry_after: std::time::Duration::from_secs(5),
-                },
-            )? {
-                crate::transcripts::types::JsonlLineState::Eof => break,
-                crate::transcripts::types::JsonlLineState::Partial => break,
-                crate::transcripts::types::JsonlLineState::Complete(bytes_read) => {
+                }
+            })? {
+                crate::streams::types::JsonlLineState::Eof => break,
+                crate::streams::types::JsonlLineState::Partial => break,
+                crate::streams::types::JsonlLineState::Complete(bytes_read) => {
                     line_number += 1;
                     current_offset += bytes_read as u64;
                 }
             }
 
+            // Skip empty lines
             if line.trim().is_empty() {
                 continue;
             }
 
+            // Parse JSONL entry
             let entry: serde_json::Value = match serde_json::from_str(&line) {
                 Ok(v) => v,
                 Err(e) => {
@@ -197,15 +206,39 @@ impl Agent for CursorAgent {
                 }
             };
 
+            // Only process "message" entries; skip session_start, todo_state, etc.
+            if entry["type"].as_str() != Some("message") {
+                continue;
+            }
+
+            // Track record count for hybrid watermark
+            record_count += 1;
+
+            // Update latest_timestamp for hybrid watermark
+            if let Some(ts_str) = entry["timestamp"].as_str()
+                && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts_str)
+            {
+                let utc_dt = dt.with_timezone(&chrono::Utc);
+                if latest_timestamp.is_none() || Some(utc_dt) > latest_timestamp {
+                    latest_timestamp = Some(utc_dt);
+                }
+            }
+
+            // Push raw JSON entry
             events.push(entry);
             if events.len() >= batch_limit {
                 break;
             }
         }
 
-        let new_watermark = Box::new(ByteOffsetWatermark::new(current_offset));
+        // Create new hybrid watermark with updated offset, record count, and timestamp
+        let new_watermark = Box::new(HybridWatermark::new(
+            current_offset,
+            record_count,
+            latest_timestamp,
+        ));
 
-        Ok(TranscriptBatch {
+        Ok(StreamBatch {
             events,
             new_watermark,
         })
@@ -213,11 +246,25 @@ impl Agent for CursorAgent {
 
     fn extract_event_timestamp(
         &self,
-        _event: &serde_json::Value,
+        event: &serde_json::Value,
         file_meta: &std::fs::Metadata,
         is_first_event: bool,
     ) -> u32 {
-        crate::transcripts::agent::file_time_fallback(file_meta, is_first_event)
+        crate::daemon::stream_worker::extract_event_timestamp(event)
+            .unwrap_or_else(|| crate::streams::agent::file_time_fallback(file_meta, is_first_event))
+    }
+
+    fn streams(&self) -> Vec<StreamDescriptor> {
+        let format = StreamFormat::DroidJsonl;
+        vec![StreamDescriptor {
+            stream_kind: "transcript",
+            format,
+            watermark_type: format.watermark_type(),
+            path_resolver: PathResolverKind::Identity,
+            shared: false,
+            watermark_type_resolver: None,
+            format_resolver: None,
+        }]
     }
 }
 
@@ -225,28 +272,19 @@ impl Agent for CursorAgent {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_sweep_strategy() {
-        let agent = CursorAgent::new();
-        assert_eq!(
-            agent.sweep_strategy(),
-            SweepStrategy::Periodic(Duration::from_secs(30 * 60))
-        );
-    }
-
-    fn make_jsonl_line(i: usize) -> String {
+    fn make_droid_line(i: usize) -> String {
         format!(
-            r#"{{"role":"user","id":{},"message":{{"content":[{{"type":"text","text":"msg-{}"}}]}}}}"#,
-            i, i
+            r#"{{"type":"message","id":{},"timestamp":"2025-01-01T00:00:{:02}Z","message":{{"role":"user","content":[{{"type":"text","text":"msg-{}"}}]}}}}"#,
+            i, i, i
         )
     }
 
     fn drain_all(
-        agent: &CursorAgent,
+        agent: &DroidAgent,
         path: &Path,
     ) -> (Vec<serde_json::Value>, Box<dyn WatermarkStrategy>) {
         let mut all = Vec::new();
-        let mut wm: Box<dyn WatermarkStrategy> = Box::new(ByteOffsetWatermark::new(0));
+        let mut wm: Box<dyn WatermarkStrategy> = Box::new(HybridWatermark::new(0, 0, None));
         loop {
             let batch = agent.read_incremental(path, wm, "test").unwrap();
             if batch.events.is_empty() {
@@ -266,11 +304,11 @@ mod tests {
 
         let mut file = NamedTempFile::new().unwrap();
         for i in 0..5 {
-            writeln!(file, "{}", make_jsonl_line(i)).unwrap();
+            writeln!(file, "{}", make_droid_line(i)).unwrap();
         }
         file.flush().unwrap();
 
-        let agent = CursorAgent::with_batch_size(2);
+        let agent = DroidAgent::with_batch_size(2);
         let (events, _) = drain_all(&agent, file.path());
 
         assert_eq!(events.len(), 5);
@@ -286,16 +324,16 @@ mod tests {
 
         let mut file = NamedTempFile::new().unwrap();
         for i in 0..3 {
-            writeln!(file, "{}", make_jsonl_line(i)).unwrap();
+            writeln!(file, "{}", make_droid_line(i)).unwrap();
         }
         file.flush().unwrap();
 
-        let agent = CursorAgent::with_batch_size(2);
+        let agent = DroidAgent::with_batch_size(2);
         let (all, wm) = drain_all(&agent, file.path());
         assert_eq!(all.len(), 3);
 
         let mut f = OpenOptions::new().append(true).open(file.path()).unwrap();
-        writeln!(f, "{}", make_jsonl_line(3)).unwrap();
+        writeln!(f, "{}", make_droid_line(3)).unwrap();
         f.flush().unwrap();
 
         let batch = agent.read_incremental(file.path(), wm, "test").unwrap();
@@ -311,16 +349,16 @@ mod tests {
 
         let mut file = NamedTempFile::new().unwrap();
         for i in 0..3 {
-            writeln!(file, "{}", make_jsonl_line(i)).unwrap();
+            writeln!(file, "{}", make_droid_line(i)).unwrap();
         }
         file.flush().unwrap();
 
-        let agent = CursorAgent::with_batch_size(2);
+        let agent = DroidAgent::with_batch_size(2);
         let (_, mut wm) = drain_all(&agent, file.path());
 
         let mut f = OpenOptions::new().append(true).open(file.path()).unwrap();
         for i in 3..6 {
-            writeln!(f, "{}", make_jsonl_line(i)).unwrap();
+            writeln!(f, "{}", make_droid_line(i)).unwrap();
         }
         f.flush().unwrap();
 
@@ -342,6 +380,15 @@ mod tests {
     }
 
     #[test]
+    fn test_sweep_strategy() {
+        let agent = DroidAgent::new();
+        assert_eq!(
+            agent.sweep_strategy(),
+            SweepStrategy::Periodic(Duration::from_secs(30 * 60))
+        );
+    }
+
+    #[test]
     fn test_read_incremental_basic() {
         use std::io::Write;
         use tempfile::NamedTempFile;
@@ -349,24 +396,38 @@ mod tests {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(
             file,
-            r#"{{"role":"user","message":{{"content":[{{"type":"text","text":"Hello"}}]}}}}"#
+            r#"{{"type":"message","timestamp":"2025-01-01T00:00:00Z","message":{{"role":"user","content":[{{"type":"text","text":"Hello"}}]}}}}"#
         )
         .unwrap();
         writeln!(
             file,
-            r#"{{"role":"assistant","message":{{"content":[{{"type":"text","text":"Hi there"}}]}}}}"#
+            r#"{{"type":"message","timestamp":"2025-01-01T00:00:01Z","message":{{"role":"assistant","content":[{{"type":"text","text":"Hi there"}}]}}}}"#
         )
         .unwrap();
         file.flush().unwrap();
 
-        let agent = CursorAgent::new();
-        let watermark = Box::new(ByteOffsetWatermark::new(0));
+        let agent = DroidAgent::new();
+        let watermark = Box::new(HybridWatermark::new(0, 0, None));
         let result = agent
             .read_incremental(file.path(), watermark, "test-session")
             .unwrap();
 
         assert_eq!(result.events.len(), 2);
-        assert_eq!(result.events[0]["role"].as_str(), Some("user"));
-        assert_eq!(result.events[1]["role"].as_str(), Some("assistant"));
+
+        // Verify raw JSON events
+        assert_eq!(result.events[0]["type"], "message");
+        assert_eq!(result.events[0]["message"]["role"], "user");
+        assert_eq!(result.events[1]["type"], "message");
+        assert_eq!(result.events[1]["message"]["role"], "assistant");
+
+        // Verify hybrid watermark was updated
+        let new_watermark = result
+            .new_watermark
+            .as_any()
+            .downcast_ref::<HybridWatermark>()
+            .unwrap();
+        assert!(new_watermark.offset > 0); // Byte offset advanced
+        assert_eq!(new_watermark.record, 2); // Two message records processed
+        assert!(new_watermark.timestamp.is_some()); // Timestamp captured
     }
 }

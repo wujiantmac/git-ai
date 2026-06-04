@@ -1,10 +1,10 @@
 //! Amp agent implementation with sweep discovery.
 
 use crate::authorship::authorship_log_serialization::generate_session_id;
-use crate::transcripts::agent::Agent;
-use crate::transcripts::sweep::{DiscoveredSession, SweepStrategy, TranscriptFormat};
-use crate::transcripts::types::{TranscriptBatch, TranscriptError};
-use crate::transcripts::watermark::{RecordIndexWatermark, WatermarkStrategy, WatermarkType};
+use crate::streams::agent::{Agent, PathResolverKind, StreamDescriptor};
+use crate::streams::sweep::{DiscoveredSession, StreamFormat, SweepStrategy};
+use crate::streams::types::{StreamBatch, StreamError};
+use crate::streams::watermark::{RecordIndexWatermark, WatermarkStrategy};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -28,7 +28,7 @@ impl AmpAgent {
     ///
     /// Checks `GIT_AI_AMP_THREADS_PATH` env var first, then falls back to
     /// platform-specific default locations.
-    pub fn amp_threads_path() -> Result<PathBuf, TranscriptError> {
+    pub fn amp_threads_path() -> Result<PathBuf, StreamError> {
         if let Ok(path) = std::env::var("GIT_AI_AMP_THREADS_PATH") {
             return Ok(PathBuf::from(path));
         }
@@ -63,7 +63,7 @@ impl AmpAgent {
             }
         }
 
-        Err(TranscriptError::Fatal {
+        Err(StreamError::Fatal {
             message: "Could not determine Amp threads path".to_string(),
         })
     }
@@ -84,7 +84,7 @@ impl Agent for AmpAgent {
         SweepStrategy::Periodic(Duration::from_secs(30 * 60))
     }
 
-    fn discover_sessions(&self) -> Result<Vec<DiscoveredSession>, TranscriptError> {
+    fn discover_sessions(&self) -> Result<Vec<DiscoveredSession>, StreamError> {
         let threads_dir = match Self::amp_threads_path() {
             Ok(p) => p,
             Err(_) => return Ok(Vec::new()),
@@ -94,7 +94,7 @@ impl Agent for AmpAgent {
             return Ok(Vec::new());
         }
 
-        let entries = fs::read_dir(&threads_dir).map_err(|e| TranscriptError::Transient {
+        let entries = fs::read_dir(&threads_dir).map_err(|e| StreamError::Transient {
             message: format!("Failed to read Amp threads directory: {}", e),
             retry_after: Duration::from_secs(30),
         })?;
@@ -119,10 +119,7 @@ impl Agent for AmpAgent {
             let session = DiscoveredSession {
                 session_id,
                 tool: "amp".to_string(),
-                transcript_path: path,
-                transcript_format: TranscriptFormat::AmpThreadJson,
-                watermark_type: WatermarkType::RecordIndex,
-                initial_watermark: Box::new(RecordIndexWatermark::new(0)),
+                stream_path: path,
                 external_session_id: file_stem,
                 external_parent_session_id: None,
             };
@@ -138,12 +135,12 @@ impl Agent for AmpAgent {
         path: &Path,
         watermark: Box<dyn WatermarkStrategy>,
         session_id: &str,
-    ) -> Result<TranscriptBatch, TranscriptError> {
+    ) -> Result<StreamBatch, StreamError> {
         // Downcast watermark to RecordIndexWatermark
         let record_watermark = watermark
             .as_any()
             .downcast_ref::<RecordIndexWatermark>()
-            .ok_or_else(|| TranscriptError::Fatal {
+            .ok_or_else(|| StreamError::Fatal {
                 message: format!(
                     "Amp reader requires RecordIndexWatermark, got incompatible type for session {}",
                     session_id
@@ -154,15 +151,15 @@ impl Agent for AmpAgent {
 
         let file = fs::File::open(path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                TranscriptError::Fatal {
+                StreamError::Fatal {
                     message: format!("Transcript file not found: {}", path.display()),
                 }
             } else if e.kind() == std::io::ErrorKind::PermissionDenied {
-                TranscriptError::Fatal {
+                StreamError::Fatal {
                     message: format!("Permission denied reading transcript: {}", path.display()),
                 }
             } else {
-                TranscriptError::Transient {
+                StreamError::Transient {
                     message: format!("Failed to read transcript file: {}", e),
                     retry_after: Duration::from_secs(5),
                 }
@@ -171,7 +168,7 @@ impl Agent for AmpAgent {
 
         let reader = std::io::BufReader::new(file);
         let mut parsed: serde_json::Value =
-            serde_json::from_reader(reader).map_err(|e| TranscriptError::Parse {
+            serde_json::from_reader(reader).map_err(|e| StreamError::Parse {
                 line: 0,
                 message: format!("Invalid JSON in {}: {}", path.display(), e),
             })?;
@@ -182,7 +179,7 @@ impl Agent for AmpAgent {
         {
             Some(serde_json::Value::Array(arr)) => arr,
             _ => {
-                return Err(TranscriptError::Fatal {
+                return Err(StreamError::Fatal {
                     message: format!(
                         "Missing 'messages' array in Amp thread file: {}",
                         path.display()
@@ -204,7 +201,7 @@ impl Agent for AmpAgent {
             (skip_count + events.len()) as u64,
         ));
 
-        Ok(TranscriptBatch {
+        Ok(StreamBatch {
             events,
             new_watermark,
         })
@@ -216,9 +213,21 @@ impl Agent for AmpAgent {
         file_meta: &std::fs::Metadata,
         is_first_event: bool,
     ) -> u32 {
-        crate::daemon::transcript_worker::extract_event_timestamp(event).unwrap_or_else(|| {
-            crate::transcripts::agent::file_time_fallback(file_meta, is_first_event)
-        })
+        crate::daemon::stream_worker::extract_event_timestamp(event)
+            .unwrap_or_else(|| crate::streams::agent::file_time_fallback(file_meta, is_first_event))
+    }
+
+    fn streams(&self) -> Vec<StreamDescriptor> {
+        let format = StreamFormat::AmpThreadJson;
+        vec![StreamDescriptor {
+            stream_kind: "transcript",
+            format,
+            watermark_type: format.watermark_type(),
+            path_resolver: PathResolverKind::Identity,
+            shared: false,
+            watermark_type_resolver: None,
+            format_resolver: None,
+        }]
     }
 }
 

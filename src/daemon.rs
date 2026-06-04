@@ -75,13 +75,13 @@ pub mod git_backend;
 pub mod global_actor;
 pub mod reducer;
 pub mod sentry_layer;
+pub mod stream_worker;
 pub mod sweep_coordinator;
 pub mod telemetry_handle;
 pub mod telemetry_worker;
 pub mod test_sync;
 pub mod trace_normalizer;
 pub mod transcript_redaction;
-pub mod transcript_worker;
 
 pub use control_api::{
     BashSessionQueryResponse, BashSnapshotQueryResponse, ControlRequest, ControlResponse,
@@ -1917,7 +1917,7 @@ fn build_human_replay_checkpoint_request(
         agent_id: None,
         files: checkpoint_files,
         path_role: PreparedPathRole::WillEdit,
-        transcript_source: None,
+        stream_source: None,
         metadata: std::collections::HashMap::new(),
     }
 }
@@ -3902,9 +3902,9 @@ pub struct ActorDaemonCoordinator {
     // exits via the shutdown select! arm instead of relying on channel closure.
     trace_ingest_tx: std::sync::OnceLock<mpsc::Sender<Value>>,
     telemetry_worker: Option<crate::daemon::telemetry_worker::DaemonTelemetryWorkerHandle>,
-    transcript_worker: Option<crate::daemon::transcript_worker::TranscriptWorkerHandle>,
+    stream_worker: Option<crate::daemon::stream_worker::StreamWorkerHandle>,
     transcript_shutdown_notify: std::sync::OnceLock<Arc<tokio::sync::Notify>>,
-    transcripts_db: Option<Arc<crate::transcripts::db::TranscriptsDatabase>>,
+    streams_db: Option<Arc<crate::streams::db::StreamsDatabase>>,
     next_trace_ingest_seq: AtomicUsize,
     next_carryover_snapshot_id: AtomicUsize,
     queued_trace_payloads: AtomicUsize,
@@ -4001,9 +4001,9 @@ impl ActorDaemonCoordinator {
             test_completion_log_lock: Mutex::new(()),
             trace_ingest_tx: std::sync::OnceLock::new(),
             telemetry_worker: None,
-            transcript_worker: None,
+            stream_worker: None,
             transcript_shutdown_notify: std::sync::OnceLock::new(),
-            transcripts_db: None,
+            streams_db: None,
             next_trace_ingest_seq: AtomicUsize::new(0),
             next_carryover_snapshot_id: AtomicUsize::new(0),
             queued_trace_payloads: AtomicUsize::new(0),
@@ -7465,10 +7465,10 @@ impl ActorDaemonCoordinator {
     async fn handle_control_request(&self, request: ControlRequest) -> ControlResponse {
         let result = match request {
             ControlRequest::CheckpointRun { request } => {
-                if let Some(worker) = &self.transcript_worker
-                    && let Some(transcript_source) = &request.transcript_source
+                if let Some(worker) = &self.stream_worker
+                    && let Some(stream_source) = &request.stream_source
                 {
-                    let session_id = transcript_source.session_id.clone();
+                    let session_id = stream_source.session_id.clone();
                     let tool = request
                         .agent_id
                         .as_ref()
@@ -7479,25 +7479,15 @@ impl ActorDaemonCoordinator {
 
                     let repo_work_dir = request.files.first().map(|f| f.repo_work_dir.clone());
 
-                    if let Some(db) = &self.transcripts_db
-                        && let Err(e) = Self::ensure_session_exists(
-                            db,
-                            &session_id,
-                            &tool,
-                            transcript_source,
-                            repo_work_dir.as_deref(),
-                        )
-                    {
-                        tracing::warn!(session_id = %session_id, error = %e, "failed to ensure session exists");
-                    }
-
                     worker.notify_checkpoint(
                         session_id,
                         tool,
                         trace_id,
                         tool_use_id,
-                        transcript_source.path.clone(),
+                        stream_source.path.clone(),
                         repo_work_dir,
+                        stream_source.external_session_id.clone(),
+                        stream_source.external_parent_session_id.clone(),
                     );
                 }
 
@@ -7646,69 +7636,6 @@ impl ActorDaemonCoordinator {
             Ok(response) => response,
             Err(error) => ControlResponse::err(error.to_string()),
         }
-    }
-
-    fn ensure_session_exists(
-        db: &crate::transcripts::db::TranscriptsDatabase,
-        session_id: &str,
-        tool: &str,
-        transcript_source: &crate::commands::checkpoint_agent::presets::TranscriptSource,
-        repo_work_dir: Option<&std::path::Path>,
-    ) -> Result<(), String> {
-        // Check if session exists
-        if db
-            .get_session(session_id)
-            .map_err(|e| e.to_string())?
-            .is_some()
-        {
-            return Ok(());
-        }
-
-        // Create new session record
-        let now = chrono::Utc::now().timestamp();
-
-        let watermark_type = transcript_source.format.watermark_type();
-
-        let initial_watermark = match watermark_type {
-            crate::transcripts::watermark::WatermarkType::ByteOffset => {
-                Box::new(crate::transcripts::watermark::ByteOffsetWatermark::new(0))
-                    as Box<dyn crate::transcripts::watermark::WatermarkStrategy>
-            }
-            crate::transcripts::watermark::WatermarkType::RecordIndex => {
-                Box::new(crate::transcripts::watermark::RecordIndexWatermark::new(0))
-                    as Box<dyn crate::transcripts::watermark::WatermarkStrategy>
-            }
-            crate::transcripts::watermark::WatermarkType::Timestamp => {
-                Box::new(crate::transcripts::watermark::TimestampWatermark::new(
-                    chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
-                )) as Box<dyn crate::transcripts::watermark::WatermarkStrategy>
-            }
-            crate::transcripts::watermark::WatermarkType::Hybrid => Box::new(
-                crate::transcripts::watermark::HybridWatermark::new(0, 0, None),
-            )
-                as Box<dyn crate::transcripts::watermark::WatermarkStrategy>,
-        };
-
-        let record = crate::transcripts::db::SessionRecord {
-            session_id: session_id.to_string(),
-            tool: tool.to_string(),
-            transcript_path: transcript_source.path.display().to_string(),
-            transcript_format: format!("{:?}", transcript_source.format),
-            watermark_type: format!("{:?}", watermark_type),
-            watermark_value: initial_watermark.serialize(),
-            external_session_id: transcript_source.external_session_id.clone(),
-            external_parent_session_id: transcript_source.external_parent_session_id.clone(),
-            first_seen_at: now,
-            last_processed_at: 0,
-            last_known_size: 0,
-            last_modified: None,
-            processing_errors: 0,
-            last_error: None,
-            repo_work_dir: repo_work_dir.map(|p| p.display().to_string()),
-        };
-
-        db.insert_session(&record).map_err(|e| e.to_string())?;
-        Ok(())
     }
 
     fn store_wrapper_state(
@@ -8533,18 +8460,20 @@ pub(crate) async fn run_daemon(config: DaemonConfig) -> Result<DaemonExitAction,
         .get_feature_flags()
         .transcript_streaming
     {
-        let transcripts_db_path = config.internal_dir.join("transcripts-db");
-        match crate::transcripts::db::TranscriptsDatabase::open(&transcripts_db_path) {
-            Ok(transcripts_db) => {
-                let transcripts_db = std::sync::Arc::new(transcripts_db);
+        // Named "transcripts-db" for backwards compatibility with existing installations.
+        // TODO: rename to "streams-db" with a migration that moves the file.
+        let streams_db_path = config.internal_dir.join("transcripts-db");
+        match crate::streams::db::StreamsDatabase::open(&streams_db_path) {
+            Ok(streams_db) => {
+                let streams_db = std::sync::Arc::new(streams_db);
                 let shutdown_notify = Arc::new(tokio::sync::Notify::new());
-                let transcript_handle = crate::daemon::transcript_worker::spawn_transcript_worker(
-                    transcripts_db.clone(),
+                let transcript_handle = crate::daemon::stream_worker::spawn_stream_worker(
+                    streams_db.clone(),
                     telemetry_handle.clone(),
                     shutdown_notify.clone(),
                 );
-                coordinator_inner.transcripts_db = Some(transcripts_db);
-                coordinator_inner.transcript_worker = Some(transcript_handle);
+                coordinator_inner.streams_db = Some(streams_db);
+                coordinator_inner.stream_worker = Some(transcript_handle);
                 let _ = coordinator_inner
                     .transcript_shutdown_notify
                     .set(shutdown_notify);
@@ -8945,7 +8874,7 @@ pub fn send_control_request_fire_and_forget(
 }
 
 #[cfg(test)]
-mod transcript_worker_tests;
+mod stream_worker_tests;
 
 #[cfg(test)]
 mod tests {
@@ -9015,7 +8944,7 @@ mod tests {
                     base_commit: BaseCommit::Initial,
                 }],
                 path_role: PreparedPathRole::WillEdit,
-                transcript_source: None,
+                stream_source: None,
                 metadata: std::collections::HashMap::new(),
             }),
         }
