@@ -346,9 +346,12 @@ if (-not [string]::IsNullOrWhiteSpace($env:GIT_AI_LOCAL_BINARY)) {
 # ============================================================
 $isElevated = $false
 try {
-    # Detect actual UAC elevation via the Win32 TokenElevation API.
-    # This matches the Rust binary's detection and correctly distinguishes
-    # "Run as Administrator" from a normal admin-group user terminal.
+    # Detect explicit UAC elevation ("Run as Administrator") via TokenElevationType.
+    # Type 1 (Default) = no split token (UAC disabled or built-in Admin) -> no warn
+    # Type 2 (Full)    = elevated half of a split token -> WARN (this is the danger case)
+    # Type 3 (Limited) = non-elevated half of a split token -> no warn
+    # We only warn on type 2: user explicitly elevated, so files will be admin-owned
+    # but normal processes won't be, causing the daemon.lock mismatch from issue #1287.
     Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
@@ -365,9 +368,10 @@ public static class GitAiElevation {
         IntPtr tok;
         if (!OpenProcessToken(GetCurrentProcess(), 0x0008, out tok)) return false;
         try {
-            int elev = 0; int sz;
-            if (!GetTokenInformation(tok, 20, ref elev, 4, out sz)) return false;
-            return elev != 0;
+            int elevType = 0; int sz;
+            // TokenElevationType = class 18; returns 1/2/3
+            if (!GetTokenInformation(tok, 18, ref elevType, 4, out sz)) return false;
+            return elevType == 2; // TokenElevationTypeFull
         } finally { CloseHandle(tok); }
     }
 }

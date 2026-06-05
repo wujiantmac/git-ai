@@ -188,12 +188,14 @@ pub fn is_running_as_superuser() -> bool {
     }
 
     const TOKEN_QUERY: u32 = 0x0008;
-    const TOKEN_ELEVATION_CLASS: u32 = 20; // TokenElevation
-
-    #[repr(C)]
-    struct TokenElevation {
-        token_is_elevated: u32,
-    }
+    // TokenElevationType (class 18) returns 1/2/3:
+    //   1 = Default (no split token — UAC disabled or built-in Admin)
+    //   2 = Full (elevated half of split token — "Run as Administrator")
+    //   3 = Limited (non-elevated half of split token — normal terminal)
+    // Only type 2 is the dangerous case: files will be admin-owned but normal
+    // processes won't be, causing permission mismatches.
+    const TOKEN_ELEVATION_TYPE_CLASS: u32 = 18;
+    const TOKEN_ELEVATION_TYPE_FULL: u32 = 2;
 
     unsafe {
         let mut token: Handle = std::ptr::null_mut();
@@ -201,18 +203,18 @@ pub fn is_running_as_superuser() -> bool {
             return false;
         }
 
-        let mut elevation: TokenElevation = mem::zeroed();
+        let mut elev_type: u32 = 0;
         let mut size: u32 = 0;
         let result = GetTokenInformation(
             token,
-            TOKEN_ELEVATION_CLASS,
-            &mut elevation as *mut _ as *mut u8,
-            mem::size_of::<TokenElevation>() as u32,
+            TOKEN_ELEVATION_TYPE_CLASS,
+            &mut elev_type as *mut _ as *mut u8,
+            mem::size_of::<u32>() as u32,
             &mut size,
         );
         CloseHandle(token);
 
-        result != 0 && elevation.token_is_elevated != 0
+        result != 0 && elev_type == TOKEN_ELEVATION_TYPE_FULL
     }
 }
 
