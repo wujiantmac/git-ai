@@ -8,7 +8,7 @@ use crate::authorship::hunk_shift::apply_hunk_shifts_to_file_attestation;
 use crate::authorship::rewrite::compute_diff_trees_batch;
 use crate::error::GitAiError;
 use crate::git::notes_api;
-use crate::git::repository::{Repository, exec_git};
+use crate::git::repository::{Repository, exec_git, exec_git_stdin};
 
 /// One reverted commit to reconstruct: the new revert commit, its parent, and
 /// the original commit that was reverted (used to locate the source note).
@@ -245,8 +245,8 @@ fn batch_rev_parse_verify(
     for spec in revspecs {
         args.push(spec.clone());
     }
-    // rev-parse prints one resolved OID per input line, in order. If any fails,
-    // it errors out; fall back to per-spec resolution only for the failures.
+    // rev-parse prints one resolved OID per input line, in order. If every spec
+    // resolves, this single spawn is all we need.
     if let Ok(output) = exec_git(&args) {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let oids: Vec<&str> = stdout.lines().collect();
@@ -257,17 +257,23 @@ fn batch_rev_parse_verify(
             return Ok(out);
         }
     }
-    // Fallback: resolve individually so one bad revspec doesn't drop the rest.
-    // This is bounded by the (rare) failure case, not the common path.
-    for spec in revspecs {
-        let mut a = repo.global_args_for_exec();
-        a.push("rev-parse".to_string());
-        a.push("--verify".to_string());
-        a.push(spec.clone());
-        if let Ok(output) = exec_git(&a) {
-            let oid = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !oid.is_empty() {
-                out.insert(spec.clone(), oid);
+    // A bad revspec makes `rev-parse --verify` fail for the whole batch. Resolve
+    // failure-tolerantly with a SINGLE `cat-file --batch-check` spawn (one line
+    // of output per input, "<oid> <type> <size>" or "<spec> missing"), so we
+    // never fall back to per-spec spawning.
+    let mut check_args = repo.global_args_for_exec();
+    check_args.push("cat-file".to_string());
+    check_args.push("--batch-check".to_string());
+    let stdin_data = format!("{}\n", revspecs.join("\n"));
+    if let Ok(output) = exec_git_stdin(&check_args, stdin_data.as_bytes()) {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for (spec, line) in revspecs.iter().zip(stdout.lines()) {
+            let mut parts = line.split_whitespace();
+            if let (Some(oid), Some(kind)) = (parts.next(), parts.next())
+                && kind != "missing"
+                && crate::git::repo_state::is_valid_git_oid(oid)
+            {
+                out.insert(spec.clone(), oid.to_string());
             }
         }
     }

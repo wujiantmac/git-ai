@@ -2672,6 +2672,30 @@ pub fn exec_git_allow_nonzero_with_env(
     exec_git_allow_nonzero_with_profile_and_env(args, InternalGitProfile::General, envs)
 }
 
+#[cfg(feature = "test-support")]
+fn spawn_probe_log(effective_args: &[String]) {
+    let Ok(path) = std::env::var("GIT_AI_SPAWN_LOG") else {
+        return;
+    };
+    let sub = effective_args
+        .iter()
+        .find(|a| !a.starts_with('-') && !a.contains('=') && !a.contains('/') && !a.contains('\\'))
+        .cloned()
+        .unwrap_or_default();
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "{}", sub);
+    }
+}
+
+#[cfg(not(feature = "test-support"))]
+#[inline]
+fn spawn_probe_log(_effective_args: &[String]) {}
+
 fn exec_git_allow_nonzero_with_profile_and_env(
     args: &[String],
     profile: InternalGitProfile,
@@ -2679,6 +2703,7 @@ fn exec_git_allow_nonzero_with_profile_and_env(
 ) -> Result<Output, GitAiError> {
     let effective_args =
         args_with_internal_git_profile(&args_with_disabled_hooks_if_needed(args), profile);
+    spawn_probe_log(&effective_args);
     let mut cmd = Command::new(config::Config::get().git_cmd());
     cmd.args(&effective_args);
     apply_internal_git_env(&mut cmd);
@@ -2796,6 +2821,7 @@ pub fn exec_git_stdin_with_profile(
     // TODO Make sure to handle process signals, etc.
     let effective_args =
         args_with_internal_git_profile(&args_with_disabled_hooks_if_needed(args), profile);
+    spawn_probe_log(&effective_args);
     let mut cmd = Command::new(config::Config::get().git_cmd());
     cmd.args(&effective_args)
         .stdin(std::process::Stdio::piped())
