@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -25,6 +26,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_TESTS_FILE = REPO_ROOT / "tests" / "git-compat" / "core-tests.txt"
 DEFAULT_WHITELIST = REPO_ROOT / "tests" / "git-compat" / "whitelist.csv"
 DEFAULT_GIT_URL = "https://github.com/git/git.git"
+DEFAULT_GIT_REF = os.environ.get("GIT_COMPAT_REF", "v2.54.0")
 DEFAULT_CLONE_DIR = Path("/tmp/git-core-tests")
 
 
@@ -80,8 +82,6 @@ def make_isolated_env(isolated_home: str) -> dict:
     env["PATH"] = os.pathsep.join(sanitized)
 
     # Find the real git binary (PATH already sanitised above).
-    import shutil
-
     real_git = shutil.which("git", path=env["PATH"]) or "/usr/bin/git"
 
     # Write git-ai config.
@@ -109,21 +109,47 @@ def make_isolated_env(isolated_home: str) -> dict:
     return env
 
 
-def ensure_git_clone(clone_dir: Path, clone_url: str, env: dict) -> None:
+def ensure_git_clone(clone_dir: Path, clone_url: str, git_ref: str, env: dict) -> None:
     if clone_dir.exists():
-        return
-    clone_dir.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        ["git", "clone", "--depth", "1", clone_url, str(clone_dir)],
-        check=True,
+        if not (clone_dir / ".git").is_dir():
+            shutil.rmtree(clone_dir)
+        else:
+            if git_ref:
+                subprocess.run(
+                    ["git", "-C", str(clone_dir), "fetch", "--depth", "1", "origin", git_ref],
+                    check=True,
+                    env=env,
+                )
+                subprocess.run(
+                    ["git", "-C", str(clone_dir), "checkout", "--detach", "FETCH_HEAD"],
+                    check=True,
+                    env=env,
+                )
+            return
+    if not clone_dir.exists():
+        clone_dir.parent.mkdir(parents=True, exist_ok=True)
+        cmd = ["git", "clone", "--depth", "1"]
+        if git_ref:
+            cmd.extend(["--branch", git_ref])
+        cmd.extend([clone_url, str(clone_dir)])
+        subprocess.run(cmd, check=True, env=env)
+
+
+def git_checkout_summary(clone_dir: Path, env: dict) -> Tuple[str, str]:
+    head = subprocess.check_output(
+        ["git", "-C", str(clone_dir), "rev-parse", "HEAD"],
         env=env,
-    )
+        text=True,
+    ).strip()
+    description = subprocess.check_output(
+        ["git", "-C", str(clone_dir), "describe", "--tags", "--always", "--dirty"],
+        env=env,
+        text=True,
+    ).strip()
+    return head, description
 
 
 def ensure_git_build(clone_dir: Path, jobs: int, env: dict) -> None:
-    build_options = clone_dir / "GIT-BUILD-OPTIONS"
-    if build_options.exists():
-        return
     subprocess.run(
         [
             "make",
@@ -311,6 +337,7 @@ def main() -> int:
     parser.add_argument("--tests-file", type=Path, default=DEFAULT_TESTS_FILE)
     parser.add_argument("--whitelist", type=Path, default=DEFAULT_WHITELIST)
     parser.add_argument("--git-url", default=DEFAULT_GIT_URL)
+    parser.add_argument("--git-ref", default=DEFAULT_GIT_REF)
     parser.add_argument("--clone-dir", type=Path, default=DEFAULT_CLONE_DIR)
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--git-ai-bin", type=Path, default=REPO_ROOT / "target" / "release" / "git-ai")
@@ -333,7 +360,8 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="git-ai-compat-home-") as isolated_home:
         env = make_isolated_env(isolated_home)
 
-        ensure_git_clone(args.clone_dir, args.git_url, env)
+        ensure_git_clone(args.clone_dir, args.git_url, args.git_ref, env)
+        git_head, git_description = git_checkout_summary(args.clone_dir, env)
         ensure_git_build(args.clone_dir, args.jobs, env)
         git_tests_dir = args.clone_dir / "t"
 
@@ -362,6 +390,7 @@ def main() -> int:
 
             cmd_preview = " ".join(shlex.quote(t) for t in tests)
             print(f"[+] Running core Git tests with: prove -j{args.jobs} {cmd_preview}")
+            print(f"[+] Git source ref={args.git_ref} description={git_description} head={git_head}")
             print(f"[+] GIT_TEST_INSTALLED={wrapper_dir}")
             print(f"[+] HOME={isolated_home} (isolated)")
 
