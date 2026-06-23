@@ -195,7 +195,9 @@ fn normalize_cursor_path(path: &str) -> String {
 }
 
 /// Extract file paths from an ApplyPatch tool_input's patch text.
-/// Delegates to the shared `parse::collect_apply_patch_paths_from_text` helper.
+/// Delegates to the shared `parse::collect_apply_patch_paths_from_text` helper,
+/// then applies `normalize_cursor_path` so patch-extracted paths get the same
+/// Windows `/c:/...` -> `C:\...` normalization as JSON-field paths.
 fn extract_paths_from_patch(tool_input: Option<&serde_json::Value>) -> Vec<String> {
     let mut paths = Vec::new();
     let patch_text = tool_input.and_then(|ti| {
@@ -206,6 +208,9 @@ fn extract_paths_from_patch(tool_input: Option<&serde_json::Value>) -> Vec<Strin
         parse::collect_apply_patch_paths_from_text(text, &mut paths);
     }
     paths
+        .into_iter()
+        .map(|p| normalize_cursor_path(&p))
+        .collect()
 }
 
 fn cursor_file_path_from_tool_input(tool_input: Option<&serde_json::Value>) -> String {
@@ -622,6 +627,33 @@ mod tests {
                 assert_eq!(
                     e.file_paths,
                     vec![PathBuf::from("/home/user/project/src/lib.rs")]
+                );
+            }
+            _ => panic!("Expected PreFileEdit"),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_cursor_apply_patch_normalizes_windows_path() {
+        // Cursor can embed Unix-style `/c:/...` paths in patch text on Windows;
+        // patch-extracted paths must be normalized just like JSON-field paths.
+        let input = json!({
+            "conversation_id": "conv-patch",
+            "workspace_roots": ["C:\\Users\\project"],
+            "hook_event_name": "preToolUse",
+            "tool_name": "ApplyPatch",
+            "tool_input": {
+                "patch": "*** Update File: /c:/Users/project/src/main.rs\nsome diff"
+            }
+        })
+        .to_string();
+        let events = CursorPreset.parse(&input, "t_test123456789a").unwrap();
+        match &events[0] {
+            ParsedHookEvent::PreFileEdit(e) => {
+                assert_eq!(
+                    e.file_paths,
+                    vec![PathBuf::from("C:\\Users\\project\\src\\main.rs")]
                 );
             }
             _ => panic!("Expected PreFileEdit"),
