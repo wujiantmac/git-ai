@@ -19,7 +19,7 @@ const SCHEMA_VERSION: usize = 4;
 
 const MAX_METRIC_UPLOAD_ATTEMPTS: u32 = 6;
 const METRIC_PROCESSING_LOCK_TIMEOUT_SECS: u64 = 10 * 60;
-const METADATA_BACKFILL_BATCH_SIZE: usize = 1000;
+pub(crate) const METADATA_BACKFILL_BATCH_SIZE: usize = 1000;
 
 /// Database migrations - each migration upgrades the schema by one version
 const MIGRATIONS: &[&str] = &[
@@ -949,7 +949,7 @@ impl MetricsDatabase {
         Ok(total)
     }
 
-    fn backfill_event_metadata_batch_after(
+    pub(crate) fn backfill_event_metadata_batch_after(
         &mut self,
         after_id: i64,
         limit: usize,
@@ -1831,6 +1831,66 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn test_backfill_event_metadata_batch_after_advances_cursor() {
+        let (mut db, _temp_dir) = create_test_db();
+        let ts1 = days_ago(3);
+        let ts2 = days_ago(2);
+        let ts3 = days_ago(1);
+        db.conn
+            .execute(
+                "INSERT INTO metrics (event_json) VALUES (?1), (?2), (?3)",
+                params![event_json(ts1), event_json(ts2), event_json(ts3)],
+            )
+            .unwrap();
+
+        let (first_summary, first_last_id) = db.backfill_event_metadata_batch_after(0, 2).unwrap();
+
+        assert_eq!(
+            first_summary,
+            MetricMetadataBackfillSummary {
+                scanned: 2,
+                updated: 2,
+            }
+        );
+        assert_eq!(
+            metric_metadata_rows(&db),
+            vec![
+                (Some(ts1 as i64), Some(1)),
+                (Some(ts2 as i64), Some(1)),
+                (None, None),
+            ]
+        );
+
+        let first_last_id = first_last_id.unwrap();
+        let (second_summary, second_last_id) = db
+            .backfill_event_metadata_batch_after(first_last_id, 2)
+            .unwrap();
+
+        assert_eq!(
+            second_summary,
+            MetricMetadataBackfillSummary {
+                scanned: 1,
+                updated: 1,
+            }
+        );
+        assert!(second_last_id.is_some_and(|id| id > first_last_id));
+        assert_eq!(
+            metric_metadata_rows(&db),
+            vec![
+                (Some(ts1 as i64), Some(1)),
+                (Some(ts2 as i64), Some(1)),
+                (Some(ts3 as i64), Some(1)),
+            ]
+        );
+
+        let (empty_summary, empty_last_id) = db
+            .backfill_event_metadata_batch_after(second_last_id.unwrap(), 2)
+            .unwrap();
+        assert_eq!(empty_summary, MetricMetadataBackfillSummary::default());
+        assert_eq!(empty_last_id, None);
     }
 
     #[test]

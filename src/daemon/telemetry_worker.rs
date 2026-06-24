@@ -8,7 +8,7 @@ use crate::api::{ApiClient, ApiContext, CasObject, CasUploadRequest};
 use crate::config::{Config, get_or_create_distinct_id};
 use crate::daemon::control_api::{CasSyncPayload, TelemetryEnvelope};
 use crate::error::GitAiError;
-use crate::metrics::db::{MetricRecord, MetricsDatabase};
+use crate::metrics::db::{METADATA_BACKFILL_BATCH_SIZE, MetricRecord, MetricsDatabase};
 use crate::metrics::{MetricEvent, MetricsBatch};
 use crate::observability::MAX_METRICS_PER_ENVELOPE;
 use serde_json::{Value, json};
@@ -340,10 +340,26 @@ fn spawn_metrics_metadata_backfill() {
 
 fn backfill_metrics_event_metadata() -> Result<(), GitAiError> {
     let db = MetricsDatabase::global()?;
-    let mut db_lock = db
-        .lock()
-        .map_err(|_| GitAiError::Generic("metrics DB lock poisoned".to_string()))?;
-    let _ = db_lock.backfill_event_metadata()?;
+    let mut after_id = 0;
+
+    loop {
+        let (summary, last_id) = {
+            let mut db_lock = db
+                .lock()
+                .map_err(|_| GitAiError::Generic("metrics DB lock poisoned".to_string()))?;
+            db_lock.backfill_event_metadata_batch_after(after_id, METADATA_BACKFILL_BATCH_SIZE)?
+        };
+
+        let Some(id) = last_id else {
+            break;
+        };
+        after_id = id;
+
+        if summary.scanned < METADATA_BACKFILL_BATCH_SIZE {
+            break;
+        }
+    }
+
     Ok(())
 }
 
