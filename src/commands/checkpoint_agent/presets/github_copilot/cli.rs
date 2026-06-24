@@ -96,13 +96,13 @@ pub(super) fn parse_cli_hooks(
             stream_source,
         })]),
         ("PreToolUse", ToolClass::FileEdit) => {
-            // `create` PreToolUse: synthesize empty dirty_files for the new path
+            // Full-file creation tools synthesize an empty pre-edit baseline
             // (mirrors the IDE `create_file` behavior).
-            if tool_name == "create" {
+            if is_create_like_cli_tool(tool_name) {
                 if extracted_paths.is_empty() {
-                    return Err(GitAiError::PresetError(
-                        "No path in CopilotCLI create tool_input".to_string(),
-                    ));
+                    return Err(GitAiError::PresetError(format!(
+                        "No path in CopilotCLI {tool_name} tool_input"
+                    )));
                 }
                 let dirty_files: HashMap<PathBuf, String> = extracted_paths
                     .iter()
@@ -167,7 +167,7 @@ fn classify_cli_tool(tool: &str) -> ToolClass {
         // than `str_replace`). We support both the old and new names side by side.
         // For `Edit`/`Write`, `tool_input` is an apply-patch string (`*** Add File: ...` /
         // `*** Update File: ...`); path extraction handles that via collect_apply_patch_paths.
-        "Bash" => ToolClass::Bash,
+        "Bash" | "PowerShell" | "Powershell" => ToolClass::Bash,
         "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => ToolClass::FileEdit,
         // Skip read-only and control tools:
         //   view, read_file, grep, glob, semantic_search — read-only (legacy lowercase).
@@ -177,6 +177,10 @@ fn classify_cli_tool(tool: &str) -> ToolClass {
         //   read_powershell / write_powershell / stop_powershell / list_powershell — same for PS.
         _ => ToolClass::Skip,
     }
+}
+
+fn is_create_like_cli_tool(tool: &str) -> bool {
+    matches!(tool, "create" | "Write")
 }
 
 #[cfg(test)]
@@ -267,6 +271,32 @@ mod tests {
                         .as_ref()
                         .unwrap()
                         .get(&PathBuf::from("/Users/a/project/very_fun.md")),
+                    Some(&String::new())
+                );
+            }
+            other => panic!("Expected PreFileEdit, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cli_write_pre_synthesizes_empty_dirty_files() {
+        let input = json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "sess-cli",
+            "cwd": "/Users/a/project",
+            "tool_name": "Write",
+            "tool_input": "*** Begin Patch\n*** Add File: very_fun.md\n+# heading\n*** End Patch\n"
+        })
+        .to_string();
+        let events = GithubCopilotPreset
+            .parse(&input, "t_test123456789a")
+            .unwrap();
+        match &events[0] {
+            ParsedHookEvent::PreFileEdit(e) => {
+                let path = PathBuf::from("/Users/a/project/very_fun.md");
+                assert_eq!(e.file_paths, vec![path.clone()]);
+                assert_eq!(
+                    e.dirty_files.as_ref().unwrap().get(&path),
                     Some(&String::new())
                 );
             }
@@ -417,6 +447,8 @@ mod tests {
         assert_eq!(classify_cli_tool("bash"), ToolClass::Bash);
         assert_eq!(classify_cli_tool("powershell"), ToolClass::Bash);
         assert_eq!(classify_cli_tool("Bash"), ToolClass::Bash);
+        assert_eq!(classify_cli_tool("PowerShell"), ToolClass::Bash);
+        assert_eq!(classify_cli_tool("Powershell"), ToolClass::Bash);
         // File edit tools (legacy lowercase)
         assert_eq!(classify_cli_tool("create"), ToolClass::FileEdit);
         assert_eq!(classify_cli_tool("str_replace"), ToolClass::FileEdit);
@@ -509,6 +541,27 @@ mod tests {
         match &events[0] {
             ParsedHookEvent::PreBashCall(e) => {
                 assert_eq!(e.tool_use_id, "cli-sess-cli-Bash");
+            }
+            other => panic!("Expected PreBashCall, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cli_claude_format_powershell_pre() {
+        let input = json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "sess-cli",
+            "cwd": "/Users/a/project",
+            "tool_name": "PowerShell",
+            "tool_input": {"command": "Get-ChildItem"}
+        })
+        .to_string();
+        let events = GithubCopilotPreset
+            .parse(&input, "t_test123456789a")
+            .unwrap();
+        match &events[0] {
+            ParsedHookEvent::PreBashCall(e) => {
+                assert_eq!(e.tool_use_id, "cli-sess-cli-PowerShell");
             }
             other => panic!("Expected PreBashCall, got {:?}", other),
         }

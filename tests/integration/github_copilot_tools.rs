@@ -288,6 +288,13 @@ fn test_copilot_cli_claude_format_edit_update_attribution() {
     .unwrap();
     repo.git(&["add", "jokes.csv"]).unwrap();
     repo.git(&["commit", "-m", "Initial jokes"]).unwrap();
+    repo.sync_daemon();
+
+    let mut file = repo.filename("jokes.csv");
+    file.assert_committed_lines(crate::lines![
+        "id,setup,punchline".unattributed_human(),
+        "1,Why do programmers prefer dark mode?,Because light attracts bugs.".unattributed_human(),
+    ]);
 
     let session_id = "a5f5793e-0cae-4cfd-9414-b35bce1c127f";
     // apply-patch string referencing the file via its repo-relative path.
@@ -361,6 +368,10 @@ fn test_copilot_cli_claude_format_edit_create_attribution() {
     std::fs::write(&existing, "# Hello\n").unwrap();
     repo.git(&["add", "readme.md"]).unwrap();
     repo.git(&["commit", "-m", "Initial"]).unwrap();
+    repo.sync_daemon();
+
+    let mut existing_file = repo.filename("readme.md");
+    existing_file.assert_committed_lines(crate::lines!["# Hello".unattributed_human()]);
 
     let session_id = "a5f5793e-0cae-4cfd-9414-b35bce1c127f";
     let new_file = repo.path().join("hello.txt");
@@ -413,6 +424,73 @@ fn test_copilot_cli_claude_format_edit_create_attribution() {
 
     let mut file = repo.filename("hello.txt");
     file.assert_lines_and_blame(crate::lines!["hi".ai(), "bye".ai()]);
+}
+
+/// Test Copilot CLI Claude-format `Write` treats the pre-edit state as empty,
+/// matching legacy `create` semantics even if the path already exists on disk.
+#[test]
+fn test_copilot_cli_claude_format_write_overwrite_attribution() {
+    let repo = TestRepo::new();
+
+    let file_path = repo.path().join("story.txt");
+    std::fs::write(&file_path, "old draft\n").unwrap();
+    repo.git(&["add", "story.txt"]).unwrap();
+    repo.git(&["commit", "-m", "Initial draft"]).unwrap();
+    repo.sync_daemon();
+
+    let mut file = repo.filename("story.txt");
+    file.assert_committed_lines(crate::lines!["old draft".unattributed_human()]);
+
+    let session_id = "a5f5793e-0cae-4cfd-9414-b35bce1c127f";
+    let patch =
+        "*** Begin Patch\n*** Add File: story.txt\n+new draft\n+second line\n*** End Patch\n";
+
+    let pre_hook_input = json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": session_id,
+        "timestamp": "2026-06-22T20:10:33.166Z",
+        "cwd": repo.path().to_str().unwrap(),
+        "tool_name": "Write",
+        "tool_input": patch,
+    });
+    repo.git_ai(&[
+        "checkpoint",
+        "github-copilot",
+        "--hook-input",
+        &pre_hook_input.to_string(),
+    ])
+    .unwrap();
+
+    std::fs::write(&file_path, "new draft\nsecond line\n").unwrap();
+
+    let post_hook_input = json!({
+        "hook_event_name": "PostToolUse",
+        "session_id": session_id,
+        "timestamp": "2026-06-22T20:10:33.212Z",
+        "cwd": repo.path().to_str().unwrap(),
+        "tool_name": "Write",
+        "tool_input": patch,
+        "tool_result": {
+            "result_type": "success",
+            "text_result_for_llm": "Wrote 1 file(s): story.txt"
+        }
+    });
+    repo.git_ai(&[
+        "checkpoint",
+        "github-copilot",
+        "--hook-input",
+        &post_hook_input.to_string(),
+    ])
+    .unwrap();
+
+    repo.sync_daemon();
+    repo.git(&["add", "story.txt"]).unwrap();
+    repo.git(&["commit", "-m", "Overwrite file via Claude-format Write"])
+        .unwrap();
+    repo.sync_daemon();
+
+    let mut file = repo.filename("story.txt");
+    file.assert_lines_and_blame(crate::lines!["new draft".ai(), "second line".ai()]);
 }
 
 /// Test Copilot CLI `view` tool is properly skipped (read-only, no checkpoint needed)
