@@ -11,6 +11,25 @@ pub const AI_AUTHORSHIP_FULL_REF: &str = "refs/notes/ai";
 pub const AI_AUTHORSHIP_FORK_TRACKING_REF: &str = "refs/notes/ai-remote/fork";
 pub const AI_AUTHORSHIP_PUSH_REFSPEC: &str = "refs/notes/ai:refs/notes/ai";
 
+/// Commit message stamped on every notes ref commit written by git-ai via `git fast-import`.
+pub const AI_NOTES_COMMIT_MESSAGE: &str = "[US0000000000000] refs/notes/ai commit message";
+
+/// Append the fast-import `data <len>\n<message>\n` stanza for [`AI_NOTES_COMMIT_MESSAGE`].
+pub fn append_notes_commit_message_stanza(script: &mut Vec<u8>) {
+    script.extend_from_slice(format!("data {}\n", AI_NOTES_COMMIT_MESSAGE.len()).as_bytes());
+    script.extend_from_slice(AI_NOTES_COMMIT_MESSAGE.as_bytes());
+    script.extend_from_slice(b"\n");
+}
+
+/// Same stanza as [`append_notes_commit_message_stanza`], for string-based fast-import streams.
+pub fn notes_commit_message_stanza() -> String {
+    format!(
+        "data {}\n{}\n",
+        AI_NOTES_COMMIT_MESSAGE.len(),
+        AI_NOTES_COMMIT_MESSAGE
+    )
+}
+
 pub fn notes_add(
     repo: &Repository,
     commit_sha: &str,
@@ -412,7 +431,7 @@ pub fn notes_add_batch(repo: &Repository, entries: &[(String, String)]) -> Resul
 
     script.extend_from_slice(b"commit refs/notes/ai\n");
     script.extend_from_slice(format!("committer git-ai <git-ai@local> {} +0000\n", now).as_bytes());
-    script.extend_from_slice(b"data 0\n");
+    append_notes_commit_message_stanza(&mut script);
     if let Some(existing_tip) = existing_notes_tip {
         script.extend_from_slice(format!("from {}\n", existing_tip).as_bytes());
     }
@@ -479,7 +498,7 @@ pub fn notes_add_blob_batch(
     let mut script = Vec::<u8>::new();
     script.extend_from_slice(b"commit refs/notes/ai\n");
     script.extend_from_slice(format!("committer git-ai <git-ai@local> {} +0000\n", now).as_bytes());
-    script.extend_from_slice(b"data 0\n");
+    append_notes_commit_message_stanza(&mut script);
     if let Some(existing_tip) = existing_notes_tip {
         script.extend_from_slice(format!("from {}\n", existing_tip).as_bytes());
     }
@@ -816,7 +835,7 @@ pub fn fallback_merge_notes_ours(repo: &Repository, source_ref: &str) -> Result<
     let mut stream = String::new();
     stream.push_str(&format!("commit {}\n", local_ref));
     stream.push_str("committer git-ai <git-ai@noreply> 0 +0000\n");
-    stream.push_str("data 23\nMerge notes (fallback)\n");
+    stream.push_str(&notes_commit_message_stanza());
     stream.push_str(&format!("from {}\n", local_commit));
     stream.push_str(&format!("merge {}\n", source_commit));
     // Start with a clean tree to avoid mixed-fanout issues
