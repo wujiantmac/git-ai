@@ -3,11 +3,12 @@ use git_ai::authorship::authorship_log_serialization::AuthorshipLog;
 use git_ai::error::GitAiError;
 use git_ai::git::notes_api;
 use git_ai::git::refs::{
-    AI_AUTHORSHIP_FORK_TRACKING_REF, CommitAuthorship, commits_with_authorship_notes,
-    copy_missing_notes_for_commits_from_ref, copy_ref, get_commits_with_notes_from_list,
-    get_reference_as_authorship_log_v3, get_reference_as_working_log, grep_ai_notes,
-    merge_notes_from_ref, note_blob_oids_for_commits, note_blob_oids_for_commits_from_ref,
-    notes_add, notes_add_batch, notes_add_blob_batch, ref_exists, show_authorship_note,
+    AI_AUTHORSHIP_FORK_TRACKING_REF, AI_NOTES_COMMIT_MESSAGE, CommitAuthorship,
+    commits_with_authorship_notes, copy_missing_notes_for_commits_from_ref, copy_ref,
+    get_commits_with_notes_from_list, get_reference_as_authorship_log_v3,
+    get_reference_as_working_log, grep_ai_notes, merge_notes_from_ref,
+    note_blob_oids_for_commits, note_blob_oids_for_commits_from_ref, notes_add, notes_add_batch,
+    notes_add_blob_batch, ref_exists, show_authorship_note,
 };
 use git_ai::git::repository::{exec_git, exec_git_stdin, find_repository_in_path};
 use std::fs;
@@ -74,6 +75,34 @@ fn test_notes_add_and_show_authorship_note() {
     let non_existent_content =
         show_authorship_note(&gitai_repo, "0000000000000000000000000000000000000000");
     assert!(non_existent_content.is_none());
+}
+
+#[test]
+fn test_notes_commit_has_fixed_commit_message() {
+    let (repo, gitai_repo) = repo_with_handle();
+
+    fs::write(repo.path().join("initial.txt"), "initial\n").unwrap();
+    repo.stage_all_and_commit("Initial commit")
+        .expect("Failed to create initial commit");
+
+    let commit_sha = head_sha(&repo);
+    notes_add(&gitai_repo, &commit_sha, r#"{"schema":"authorship/3.0.0"}"#)
+        .expect("Failed to add authorship note");
+
+    let mut args = gitai_repo.global_args_for_exec();
+    args.extend([
+        "log".to_string(),
+        "-1".to_string(),
+        "--format=%B".to_string(),
+        "refs/notes/ai".to_string(),
+    ]);
+    let output = exec_git(&args).expect("git log refs/notes/ai");
+    let message = String::from_utf8(output.stdout)
+        .expect("git log stdout utf8")
+        .trim()
+        .to_string();
+
+    assert_eq!(message, AI_NOTES_COMMIT_MESSAGE);
 }
 
 #[test]
