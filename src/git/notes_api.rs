@@ -319,7 +319,7 @@ pub fn materialize_notes_for_display(repo: &Repository, limit: usize) -> Result<
     // stale notes from prior materializations are removed.
     stream.push_str("commit refs/notes/ai-display\n");
     stream.push_str("committer git-ai <git-ai@localhost> 1000000000 +0000\n");
-    stream.push_str("data 0\n");
+    stream.push_str(&crate::git::refs::notes_commit_message_stanza());
     stream.push_str("from 0000000000000000000000000000000000000000\n");
 
     let count = marks.len();
