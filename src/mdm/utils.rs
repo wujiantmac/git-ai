@@ -9,7 +9,7 @@ use std::process::Command;
 
 // Minimum version requirements
 pub const MIN_CURSOR_VERSION: (u32, u32) = (1, 7);
-pub const MIN_CODE_VERSION: (u32, u32) = (1, 99);
+pub const MIN_CODE_VERSION: (u32, u32) = (1, 96);
 pub const MIN_CLAUDE_VERSION: (u32, u32) = (2, 0);
 pub const MIN_CODEX_VERSION: (u32, u32) = (0, 124);
 
@@ -837,12 +837,12 @@ mod tests {
         let old_cursor = parse_version("1.6.99").unwrap();
         assert!(!version_meets_requirement(old_cursor, MIN_CURSOR_VERSION));
 
-        // VS Code 1.104.3 should meet requirement of 1.99
+        // VS Code 1.104.3 should meet requirement of 1.96
         let code_version = parse_version("1.104.3").unwrap();
         assert!(version_meets_requirement(code_version, MIN_CODE_VERSION));
 
-        // VS Code 1.98.x should fail
-        let old_code = parse_version("1.98.5").unwrap();
+        // VS Code 1.95.x should fail
+        let old_code = parse_version("1.95.5").unwrap();
         assert!(!version_meets_requirement(old_code, MIN_CODE_VERSION));
 
         // Claude Code 2.0.8 should meet requirement of 2.0
